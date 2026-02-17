@@ -36,67 +36,50 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.Backend = void 0;
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
-const child_process = __importStar(require("child_process"));
 const fs = __importStar(require("fs"));
+const https = __importStar(require("https"));
+const child_process = __importStar(require("child_process")); // For running files
 class Backend {
     constructor(context) {
         this.outputBuffer = '';
-        this.isReady = false;
+        this.RENDER_BACKEND_URL = 'https://ai-code-backend1.onrender.com';
+        // Pending confirmation data (for file overwrite etc.)
+        this.pendingConfirmation = null;
         this.context = context;
     }
-    /**
-     * Get the workspace root path from the currently open workspace.
-     * Returns undefined if no workspace is open.
-     */
+    // ------------------------------------------------------------------------
+    // Workspace helper methods (restored from original)
+    // ------------------------------------------------------------------------
     getWorkspaceRoot() {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders || workspaceFolders.length === 0) {
             return undefined;
         }
-        // Get the first workspace folder's path
         return workspaceFolders[0].uri.fsPath;
     }
-    /**
-     * Check if workspace is open and show error if not.
-     * Returns the workspace root path if valid.
-     */
     validateWorkspace() {
         const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) {
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: 'Please open a folder before generating files.'
-                });
-            }
-            return undefined;
+        if (!workspaceRoot && this.view) {
+            this.view.webview.postMessage({
+                type: 'error',
+                text: 'Please open a folder before generating files.'
+            });
         }
         return workspaceRoot;
     }
-    /**
-     * Create a file in the workspace with the given content.
-     * Automatically creates parent directories if they don't exist.
-     * Opens the file in the editor after creation.
-     */
     async createFileInWorkspace(relativePath, content) {
         const workspaceRoot = this.validateWorkspace();
-        if (!workspaceRoot) {
+        if (!workspaceRoot)
             return false;
-        }
         try {
-            // Use path.join() to create the full file path
             const fullPath = path.join(workspaceRoot, relativePath);
             const fullDirPath = path.dirname(fullPath);
-            // Use fs.mkdirSync() with recursive option to create directories
             if (!fs.existsSync(fullDirPath)) {
                 fs.mkdirSync(fullDirPath, { recursive: true });
-                console.log('Created directory:', fullDirPath);
             }
-            // Use fs.writeFileSync() to write content with UTF-8 encoding
             fs.writeFileSync(fullPath, content, 'utf8');
-            console.log('Created file:', fullPath);
-            // Automatically open the created file in the editor
-            const document = await vscode.window.showTextDocument(vscode.Uri.file(fullPath), {
+            // Open the file in the editor
+            await vscode.window.showTextDocument(vscode.Uri.file(fullPath), {
                 viewColumn: vscode.ViewColumn.One,
                 preserveFocus: false
             });
@@ -119,23 +102,21 @@ class Backend {
             return false;
         }
     }
-    /**
-     * Create multiple files in the workspace.
-     */
     async createFilesInWorkspace(files) {
         const workspaceRoot = this.validateWorkspace();
-        if (!workspaceRoot) {
+        if (!workspaceRoot)
             return false;
-        }
         let allSuccess = true;
         for (const file of files) {
             const success = await this.createFileInWorkspace(file.path, file.content);
-            if (!success) {
+            if (!success)
                 allSuccess = false;
-            }
         }
         return allSuccess;
     }
+    // ------------------------------------------------------------------------
+    // Webview
+    // ------------------------------------------------------------------------
     resolveWebviewView(webviewView, context, token) {
         this.view = webviewView;
         webviewView.webview.options = {
@@ -155,22 +136,16 @@ class Backend {
                         vscode.env.openExternal(vscode.Uri.parse(message.url));
                     }
                     return;
-                case 'searchFiles':
-                    this.handleSearchFiles(message.keyword, message.fileType);
-                    return;
-                case 'searchFolders':
-                    this.handleSearchFolders(message.keyword);
-                    return;
-                case 'searchInFiles':
-                    this.handleSearchInFiles(message.keyword, message.filePattern);
-                    return;
-                case 'getFileInfo':
-                    this.handleGetFileInfo(message.path);
-                    return;
             }
         }, undefined, this.context.subscriptions);
         // Start the Python backend
-        this.startPythonBackend();
+        // Send ready signal immediately - no backend to start
+        if (this.view) {
+            this.view.webview.postMessage({
+                type: 'ready',
+                text: 'Hello! What would you like to work on today?'
+            });
+        }
     }
     getWebviewContent() {
         const htmlPath = path.join(this.context.extensionPath, 'media', 'chat.html');
@@ -417,307 +392,508 @@ class Backend {
 </body>
 </html>`;
     }
-    startPythonBackend() {
-        const pythonScript = path.join(this.context.extensionPath, 'python', 'backend.py');
-        console.log('Starting Python backend:', pythonScript);
-        console.log('Extension path:', this.context.extensionPath);
-        // Check if Python script exists
-        if (!fs.existsSync(pythonScript)) {
-            console.error('Python backend script not found:', pythonScript);
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: `Backend script not found: ${pythonScript}`
-                });
-            }
-            return;
-        }
-        // Check if Python is available - use system Python by default
-        const pythonCommand = process.platform === 'win32' ? 'python' : 'python3';
-        const useConda = false; // Disabled - use system Python
-        const condaEnvPath = '/home/vectone/miniconda3/envs/audio_env'; // Not used
-        let spawnCommand;
-        let spawnArgs;
-        if (useConda) {
-            // Use the Python executable directly from the conda environment
-            spawnCommand = path.join(condaEnvPath, 'bin', pythonCommand);
-            spawnArgs = [pythonScript];
-            console.log('Using conda environment Python:', spawnCommand);
-        }
-        else {
-            // Use system Python
-            spawnCommand = pythonCommand;
-            spawnArgs = [pythonScript];
-            console.log('Using system Python:', spawnCommand);
-        }
-        try {
-            this.pythonProcess = child_process.spawn(spawnCommand, spawnArgs, {
-                stdio: ['pipe', 'pipe', 'pipe']
-            });
-        }
-        catch (error) {
-            console.error('Failed to spawn Python process:', error);
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: `Failed to start Python: ${error}`
-                });
-            }
-            return;
-        }
-        // Show initial loading message
-        if (this.view) {
-            this.view.webview.postMessage({ type: 'status', text: 'Starting AI Assistant...' });
-        }
-        this.pythonProcess.stdout?.on('data', (data) => {
-            const text = data.toString();
-            console.log('Python stdout:', text);
-            this.outputBuffer += text;
-            // Process complete JSON lines
-            const lines = this.outputBuffer.split('\n');
-            this.outputBuffer = lines.pop() || '';
-            for (const line of lines) {
-                if (line.trim()) {
-                    try {
-                        const message = JSON.parse(line.trim());
-                        console.log('Parsed message:', message);
-                        this.handlePythonMessage(message);
-                    }
-                    catch (e) {
-                        console.error('Failed to parse Python message:', line, e);
-                    }
+    httpsPost(url, data) {
+        return new Promise((resolve, reject) => {
+            const urlObj = new URL(url);
+            const options = {
+                hostname: urlObj.hostname,
+                port: 443,
+                path: urlObj.pathname,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(data)
                 }
-            }
+            };
+            const req = https.request(options, (res) => {
+                let responseData = '';
+                res.on('data', (chunk) => { responseData += chunk; });
+                res.on('end', () => { resolve(responseData); });
+            });
+            req.on('error', reject);
+            req.write(data);
+            req.end();
         });
-        this.pythonProcess.stderr?.on('data', (data) => {
-            const errorText = data.toString();
-            console.error(`Python backend error: ${errorText}`);
-            if (this.view) {
-                this.view.webview.postMessage({ type: 'error', text: `Backend: ${errorText}` });
-            }
-        });
-        this.pythonProcess.on('close', (code) => {
-            console.log(`Python backend exited with code ${code}`);
-            this.isReady = false;
-            if (this.view) {
-                this.view.webview.postMessage({ type: 'error', text: 'AI Assistant disconnected' });
-            }
-        });
-        this.pythonProcess.on('error', (error) => {
-            console.error('Failed to start Python backend:', error);
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: `Failed to start AI Assistant: ${error.message}. Make sure Python is installed.`
-                });
-            }
-        });
-        // Handle spawn errors specifically
-        this.pythonProcess.on('spawn', () => {
-            console.log('Python process spawned successfully');
-        });
-        // Timeout: if not ready after 10 seconds, show error
-        setTimeout(() => {
-            if (!this.isReady && this.view) {
-                console.error('Python backend failed to become ready within 10 seconds');
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: 'AI Assistant failed to start. Check that Python is installed and the Gemini API is configured.'
-                });
-            }
-        }, 10000);
     }
-    handlePythonMessage(message) {
-        if (!this.view) {
-            console.log('No view available to handle message');
-            return;
-        }
-        console.log('Handling message:', message);
-        // Handle file creation requests from Python backend
-        if (message.type === 'create_file') {
-            console.log('Creating file:', message.file_path);
-            this.createFileInWorkspace(message.file_path, message.content);
-            return;
-        }
-        // Handle multiple file creation requests
-        if (message.type === 'create_files') {
-            console.log('Creating multiple files:', message.files?.length || 0);
-            this.createFilesInWorkspace(message.files || []);
-            return;
-        }
-        switch (message.type) {
-            case 'ready':
-                console.log('Python backend is ready');
-                this.isReady = true;
-                this.view.webview.postMessage(message);
-                break;
-            case 'response':
-                console.log('Received response:', message.text?.substring(0, 100));
-                this.view.webview.postMessage(message);
-                break;
-            case 'error':
-                console.log('Received error:', message.text);
-                this.view.webview.postMessage(message);
-                break;
-            case 'status':
-                this.view.webview.postMessage(message);
-                break;
-            case 'website_complete':
-                console.log('Website generation complete:', message.preview_url);
-                this.view.webview.postMessage(message);
-                break;
-            case 'confirmation':
-                this.view.webview.postMessage(message);
-                break;
-            case 'search_results':
-                console.log('Received search results:', message.search_results);
-                this.view.webview.postMessage(message);
-                break;
-            default:
-                console.log('Unknown message type:', message.type);
-        }
-    }
-    handleSearchFiles(keyword, fileType) {
-        if (!this.isReady || !this.pythonProcess || this.pythonProcess.killed) {
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: 'AI Assistant is not ready. Please wait...'
-                });
-            }
-            return;
-        }
-        const message = JSON.stringify({
-            type: 'message',
-            text: `search files with keyword "${keyword}"${fileType ? ` and type ${fileType}` : ''}`
-        }) + '\n';
-        try {
-            this.pythonProcess.stdin?.write(message);
-        }
-        catch (error) {
-            console.error('Failed to send search request:', error);
-        }
-    }
-    handleSearchFolders(keyword) {
-        if (!this.isReady || !this.pythonProcess || this.pythonProcess.killed) {
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: 'AI Assistant is not ready. Please wait...'
-                });
-            }
-            return;
-        }
-        const message = JSON.stringify({
-            type: 'message',
-            text: `search folders with keyword "${keyword}"`
-        }) + '\\n';
-        try {
-            this.pythonProcess.stdin?.write(message);
-        }
-        catch (error) {
-            console.error('Failed to send search request:', error);
-        }
-    }
-    handleSearchInFiles(keyword, filePattern) {
-        if (!this.isReady || !this.pythonProcess || this.pythonProcess.killed) {
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: 'AI Assistant is not ready. Please wait...'
-                });
-            }
-            return;
-        }
-        const message = JSON.stringify({
-            type: 'message',
-            text: `search in files for "${keyword}"${filePattern ? ` in ${filePattern} files` : ''}`
-        }) + '\\n';
-        try {
-            this.pythonProcess.stdin?.write(message);
-        }
-        catch (error) {
-            console.error('Failed to send search request:', error);
-        }
-    }
-    handleGetFileInfo(filePath) {
-        if (!this.isReady || !this.pythonProcess || this.pythonProcess.killed) {
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: 'AI Assistant is not ready. Please wait...'
-                });
-            }
-            return;
-        }
-        const message = JSON.stringify({
-            type: 'message',
-            text: `get file info for ${filePath}`
-        }) + '\\n';
-        try {
-            this.pythonProcess.stdin?.write(message);
-        }
-        catch (error) {
-            console.error('Failed to send file info request:', error);
-        }
-    }
-    handleMessage(text, files) {
-        console.log('Handling message, isReady:', this.isReady);
-        console.log('Python process exists:', !!this.pythonProcess);
-        console.log('Python process killed:', this.pythonProcess?.killed);
-        console.log('Files attached:', files?.length || 0);
-        // Show thinking indicator in frontend
+    async handleMessage(text, files) {
+        console.log('Handling message:', text);
+        // Show thinking indicator
         if (this.view) {
             this.view.webview.postMessage({ type: 'thinking' });
         }
-        if (!this.isReady) {
-            console.log('Backend not ready, cannot send message');
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: 'AI Assistant is not ready yet. Please wait or check the console for errors.'
-                });
-            }
-            return;
-        }
-        if (this.pythonProcess && this.pythonProcess.stdin && !this.pythonProcess.killed) {
-            const messageObj = { type: 'message', text: text };
-            // Include files if any
-            if (files && files.length > 0) {
-                messageObj.files = files;
-                console.log('Files to send:', files.map((f) => ({ name: f.name, type: f.type })));
-            }
-            const message = JSON.stringify(messageObj) + '\n';
-            console.log('Sending to Python:', message.substring(0, 200) + '...');
-            try {
-                this.pythonProcess.stdin.write(message);
-                console.log('Message sent successfully');
-            }
-            catch (error) {
-                console.error('Failed to write to Python stdin:', error);
-                if (this.view) {
-                    this.view.webview.postMessage({
-                        type: 'error',
-                        text: `Failed to send message: ${error}`
-                    });
+        try {
+            const postData = JSON.stringify({ prompt: text });
+            const response = await this.httpsPost(`${this.RENDER_BACKEND_URL}/generate`, postData);
+            const data = JSON.parse(response); // Backend should return { response: "..." }
+            let assistantReply = data.response || JSON.stringify(data);
+            // --------------------------------------------------------------------
+            // Extract and execute JSON actions from the assistant's reply
+            // --------------------------------------------------------------------
+            const actionResults = [];
+            const jsonObjects = this.extractJsonObjects(assistantReply);
+            if (jsonObjects.length > 0) {
+                for (const actionData of jsonObjects) {
+                    try {
+                        const result = await this.executeAction(actionData);
+                        if (result)
+                            actionResults.push(result);
+                    }
+                    catch (err) {
+                        actionResults.push(`[ERROR] Failed to execute action: ${err}`);
+                    }
                 }
             }
-        }
-        else {
-            console.error('Python process or stdin not available');
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'error',
-                    text: 'AI Assistant not available. The backend may have crashed.'
-                });
+            // If we extracted actions and executed them, send the combined result
+            if (actionResults.length > 0) {
+                // Remove the original JSON parts from the reply (optional)
+                const cleanedReply = this.removeJsonFromText(assistantReply);
+                const finalResponse = cleanedReply + (cleanedReply ? '\n\n' : '') + actionResults.join('\n\n');
+                this.view?.webview.postMessage({ type: 'response', text: finalResponse });
+            }
+            else {
+                // No actions, just the reply
+                this.view?.webview.postMessage({ type: 'response', text: assistantReply });
             }
         }
-    }
-    dispose() {
-        if (this.pythonProcess) {
-            this.pythonProcess.stdin?.end();
-            this.pythonProcess.kill();
+        catch (error) {
+            console.error('Failed to call backend API:', error);
+            this.view?.webview.postMessage({
+                type: 'error',
+                text: `Failed to connect to AI Assistant: ${error}. Please check your internet connection.`
+            });
         }
+    }
+    // ------------------------------------------------------------------------
+    // JSON action execution (restored from original Python logic)
+    // ------------------------------------------------------------------------
+    async executeAction(actionData) {
+        const action = (actionData.action || actionData.intent || '').toString().toLowerCase().replace(/\s+/g, '_');
+        // CREATE FOLDER
+        if (action.includes('create_folder') || action === 'createfolder') {
+            const folder = actionData.folder || actionData.name;
+            if (!folder)
+                return '[ERROR] Missing folder name';
+            return this.createFolder(folder);
+        }
+        // CREATE PROJECT (multiple files)
+        if (action.includes('create_project') || action === 'createproject') {
+            const folder = actionData.folder || actionData.name || actionData.project;
+            const files = actionData.files || [];
+            if (!folder || !files.length)
+                return '[ERROR] Missing folder name or files list';
+            return this.createProject(folder, files);
+        }
+        // CREATE FILE
+        if (action.includes('create_file') || action === 'createfile') {
+            const filePath = actionData.path || actionData.filename || actionData.file;
+            const content = actionData.content || '';
+            if (!filePath)
+                return '[ERROR] Missing file path';
+            return this.createFile(filePath, content);
+        }
+        // UPDATE FILE
+        if (action.includes('update_file') || action === 'updatefile') {
+            const filePath = actionData.path || actionData.filename || actionData.file;
+            const content = actionData.content || '';
+            if (!filePath)
+                return '[ERROR] Missing file path';
+            return this.updateFile(filePath, content);
+        }
+        // DEBUG FILE (auto-fix) – same as update_file for now
+        if (action.includes('debug_file') || action === 'debugfile') {
+            const filePath = actionData.path || actionData.filename || actionData.file;
+            const content = actionData.content || '';
+            if (!filePath)
+                return '[ERROR] Missing file path';
+            return this.updateFile(filePath, content);
+        }
+        // RUN FILE
+        if (action.includes('run_file') || action === 'runfile' || action.includes('test_file')) {
+            const filePath = actionData.path || actionData.filename || actionData.file;
+            const environment = actionData.environment || 'none';
+            if (!filePath)
+                return '[ERROR] Missing file path';
+            return this.runFile(filePath, environment);
+        }
+        // SEARCH FILES
+        if (action.includes('search_files') || action === 'searchfiles') {
+            const keyword = actionData.keyword || actionData.search || actionData.query;
+            const fileType = actionData.file_type || actionData.extension;
+            const maxResults = actionData.max_results || 10;
+            if (!keyword)
+                return '[ERROR] Missing search keyword';
+            const results = this.searchFiles(keyword, fileType, maxResults);
+            return this.formatSearchResults(results, 'files');
+        }
+        // SEARCH FOLDERS
+        if (action.includes('search_folders') || action === 'searchfolders') {
+            const keyword = actionData.keyword || actionData.search || actionData.query;
+            const maxResults = actionData.max_results || 10;
+            if (!keyword)
+                return '[ERROR] Missing search keyword';
+            const results = this.searchFolders(keyword, maxResults);
+            return this.formatSearchResults(results, 'folders');
+        }
+        // SEARCH IN FILES (content)
+        if (action.includes('search_in_files') || action === 'searchinfiles' || action === 'grep') {
+            const keyword = actionData.keyword || actionData.search || actionData.query;
+            const filePattern = actionData.file_pattern || actionData.pattern || '*';
+            const maxResults = actionData.max_results || 10;
+            if (!keyword)
+                return '[ERROR] Missing search keyword';
+            const results = this.searchInFiles(keyword, filePattern, maxResults);
+            return this.formatSearchResults(results, 'content matches');
+        }
+        // GET FILE INFO
+        if (action.includes('get_file_info') || action === 'getfileinfo' || action === 'file_info') {
+            const filePath = actionData.path || actionData.file || actionData.filename;
+            if (!filePath)
+                return '[ERROR] Missing file path';
+            const info = this.getFileInfo(filePath);
+            return this.formatFileInfo(info);
+        }
+        return `[INFO] Unknown action: ${action}`;
+    }
+    // ------------------------------------------------------------------------
+    // File system action implementations (ported from original Python)
+    // ------------------------------------------------------------------------
+    createFolder(folder) {
+        const workspaceRoot = this.getWorkspaceRoot();
+        if (!workspaceRoot)
+            return '[ERROR] No workspace open';
+        const fullPath = path.join(workspaceRoot, folder);
+        try {
+            if (fs.existsSync(fullPath)) {
+                return `[INFO] Folder '${fullPath}' already exists.`;
+            }
+            fs.mkdirSync(fullPath, { recursive: true });
+            return `[OK] Folder '${fullPath}' created.`;
+        }
+        catch (err) {
+            return `[ERROR] ${err}`;
+        }
+    }
+    createProject(folder, files) {
+        const workspaceRoot = this.getWorkspaceRoot();
+        if (!workspaceRoot)
+            return '[ERROR] No workspace open';
+        const projectPath = path.join(workspaceRoot, folder);
+        const results = [];
+        try {
+            if (!fs.existsSync(projectPath)) {
+                fs.mkdirSync(projectPath, { recursive: true });
+                results.push(`[OK] Created project folder: ${projectPath}`);
+            }
+            else {
+                results.push(`[INFO] Project folder '${folder}' already exists.`);
+            }
+            let created = 0, updated = 0, errors = 0;
+            for (const file of files) {
+                try {
+                    const relPath = file.path;
+                    const fullPath = path.join(projectPath, relPath);
+                    const parentDir = path.dirname(fullPath);
+                    if (!fs.existsSync(parentDir)) {
+                        fs.mkdirSync(parentDir, { recursive: true });
+                    }
+                    const exists = fs.existsSync(fullPath);
+                    fs.writeFileSync(fullPath, file.content, 'utf8');
+                    const displayPath = path.join(folder, relPath);
+                    if (exists) {
+                        results.push(`[UPDATED] ${displayPath}`);
+                        updated++;
+                    }
+                    else {
+                        results.push(`[CREATED] ${displayPath}`);
+                        created++;
+                    }
+                }
+                catch (e) {
+                    results.push(`[ERROR] Failed to create ${file.path}: ${e}`);
+                    errors++;
+                }
+            }
+            results.push(`[SUMMARY] Created: ${created}, Updated: ${updated}, Errors: ${errors}`);
+            return results.join('\n');
+        }
+        catch (err) {
+            return `[ERROR] Failed to create project: ${err}`;
+        }
+    }
+    createFile(filePath, content) {
+        const workspaceRoot = this.getWorkspaceRoot();
+        if (!workspaceRoot)
+            return '[ERROR] No workspace open';
+        const fullPath = path.join(workspaceRoot, filePath);
+        // Check if file already exists (simple check)
+        if (fs.existsSync(fullPath)) {
+            // Ask for confirmation (store pending and return confirmation request)
+            this.pendingConfirmation = {
+                action: 'create_file',
+                path: filePath,
+                content: content
+            };
+            if (this.view) {
+                this.view.webview.postMessage({
+                    type: 'confirmation',
+                    text: `File '${filePath}' already exists. Overwrite? (yes/no)`,
+                    action: this.pendingConfirmation
+                });
+            }
+            return `[CONFIRMATION_REQUIRED] File exists. Waiting for user response.`;
+        }
+        try {
+            const dir = path.dirname(fullPath);
+            if (!fs.existsSync(dir))
+                fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(fullPath, content, 'utf8');
+            // Open file
+            vscode.window.showTextDocument(vscode.Uri.file(fullPath));
+            return `[OK] Created: ${filePath}`;
+        }
+        catch (err) {
+            return `[ERROR] ${err}`;
+        }
+    }
+    updateFile(filePath, content) {
+        const workspaceRoot = this.getWorkspaceRoot();
+        if (!workspaceRoot)
+            return '[ERROR] No workspace open';
+        const fullPath = path.join(workspaceRoot, filePath);
+        if (!fs.existsSync(fullPath)) {
+            // File doesn't exist – ask to create?
+            this.pendingConfirmation = {
+                action: 'update_file',
+                path: filePath,
+                content: content
+            };
+            if (this.view) {
+                this.view.webview.postMessage({
+                    type: 'confirmation',
+                    text: `File '${filePath}' does not exist. Create it? (yes/no)`,
+                    action: this.pendingConfirmation
+                });
+            }
+            return `[CONFIRMATION_REQUIRED] File not found.`;
+        }
+        try {
+            fs.writeFileSync(fullPath, content, 'utf8');
+            return `[OK] Updated: ${filePath}`;
+        }
+        catch (err) {
+            return `[ERROR] ${err}`;
+        }
+    }
+    runFile(filePath, environment) {
+        const workspaceRoot = this.getWorkspaceRoot();
+        if (!workspaceRoot)
+            return '[ERROR] No workspace open';
+        const fullPath = path.join(workspaceRoot, filePath);
+        if (!fs.existsSync(fullPath)) {
+            return `[ERROR] File '${filePath}' not found.`;
+        }
+        // Simple execution based on extension
+        let command;
+        if (filePath.endsWith('.py')) {
+            command = `python "${fullPath}"`;
+        }
+        else if (filePath.endsWith('.js')) {
+            command = `node "${fullPath}"`;
+        }
+        else if (filePath.endsWith('.sh')) {
+            command = `bash "${fullPath}"`;
+        }
+        else {
+            return `[ERROR] Unsupported file type for execution.`;
+        }
+        try {
+            const output = child_process.execSync(command, { encoding: 'utf8', timeout: 10000 });
+            return `[RUN] Output:\n${output}`;
+        }
+        catch (err) {
+            return `[ERROR] Execution failed:\n${err.stderr || err.message}`;
+        }
+    }
+    // ------------------------------------------------------------------------
+    // Search methods (simplified versions)
+    // ------------------------------------------------------------------------
+    searchFiles(keyword, fileType, maxResults = 10) {
+        const workspaceRoot = this.getWorkspaceRoot();
+        if (!workspaceRoot)
+            return [{ error: 'No workspace open' }];
+        const results = [];
+        const walk = (dir) => {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    if (!entry.name.startsWith('.') && entry.name !== 'node_modules' && entry.name !== '__pycache__') {
+                        walk(fullPath);
+                    }
+                }
+                else {
+                    if (entry.name.toLowerCase().includes(keyword.toLowerCase())) {
+                        if (fileType && !entry.name.endsWith(fileType))
+                            continue;
+                        results.push({
+                            name: entry.name,
+                            path: path.relative(workspaceRoot, fullPath),
+                            size: fs.statSync(fullPath).size,
+                            modified: new Date(fs.statSync(fullPath).mtime).toLocaleString()
+                        });
+                        if (results.length >= maxResults)
+                            return;
+                    }
+                }
+            }
+        };
+        walk(workspaceRoot);
+        return results;
+    }
+    searchFolders(keyword, maxResults = 10) {
+        const workspaceRoot = this.getWorkspaceRoot();
+        if (!workspaceRoot)
+            return [{ error: 'No workspace open' }];
+        const results = [];
+        const walk = (dir) => {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                if (entry.isDirectory()) {
+                    const fullPath = path.join(dir, entry.name);
+                    if (entry.name.toLowerCase().includes(keyword.toLowerCase())) {
+                        results.push({
+                            name: entry.name,
+                            path: path.relative(workspaceRoot, fullPath),
+                            file_count: fs.readdirSync(fullPath).length
+                        });
+                        if (results.length >= maxResults)
+                            return;
+                    }
+                    if (!entry.name.startsWith('.') && entry.name !== 'node_modules' && entry.name !== '__pycache__') {
+                        walk(fullPath);
+                    }
+                }
+            }
+        };
+        walk(workspaceRoot);
+        return results;
+    }
+    searchInFiles(keyword, filePattern = '*', maxResults = 10) {
+        const workspaceRoot = this.getWorkspaceRoot();
+        if (!workspaceRoot)
+            return [{ error: 'No workspace open' }];
+        const results = [];
+        const textExtensions = ['.py', '.js', '.ts', '.html', '.css', '.json', '.md', '.txt', '.xml', '.yaml', '.yml'];
+        const walk = (dir) => {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    if (!entry.name.startsWith('.') && entry.name !== 'node_modules' && entry.name !== '__pycache__') {
+                        walk(fullPath);
+                    }
+                }
+                else {
+                    const ext = path.extname(entry.name).toLowerCase();
+                    if (!textExtensions.includes(ext))
+                        continue;
+                    if (filePattern !== '*' && !entry.name.includes(filePattern.replace('*', '')))
+                        continue;
+                    try {
+                        const content = fs.readFileSync(fullPath, 'utf8');
+                        const lines = content.split('\n');
+                        const matches = [];
+                        for (let i = 0; i < lines.length; i++) {
+                            if (lines[i].toLowerCase().includes(keyword.toLowerCase())) {
+                                matches.push({ line: i + 1, content: lines[i].trim().substring(0, 100) });
+                                if (matches.length >= 3)
+                                    break;
+                            }
+                        }
+                        if (matches.length > 0) {
+                            results.push({
+                                name: entry.name,
+                                path: path.relative(workspaceRoot, fullPath),
+                                matches: matches.length,
+                                lines: matches
+                            });
+                            if (results.length >= maxResults)
+                                return;
+                        }
+                    }
+                    catch (e) { /* ignore unreadable */ }
+                }
+            }
+        };
+        walk(workspaceRoot);
+        return results;
+    }
+    getFileInfo(filePath) {
+        const workspaceRoot = this.getWorkspaceRoot();
+        if (!workspaceRoot)
+            return { error: 'No workspace open' };
+        const fullPath = path.join(workspaceRoot, filePath);
+        if (!fs.existsSync(fullPath))
+            return { error: 'File not found' };
+        const stat = fs.statSync(fullPath);
+        return {
+            name: path.basename(fullPath),
+            path: path.relative(workspaceRoot, fullPath),
+            size: stat.size,
+            created: stat.birthtime.toLocaleString(),
+            modified: stat.mtime.toLocaleString(),
+            isDirectory: stat.isDirectory()
+        };
+    }
+    formatSearchResults(results, type) {
+        if (results.length === 0)
+            return `[INFO] No ${type} found.`;
+        if (results[0].error)
+            return `[ERROR] ${results[0].error}`;
+        const lines = [`[OK] Found ${results.length} ${type}:`];
+        results.forEach((r, i) => {
+            lines.push(`${i + 1}. ${r.name} (${r.path})`);
+            if (type === 'files')
+                lines.push(`   Size: ${r.size} bytes, Modified: ${r.modified}`);
+            if (type === 'folders')
+                lines.push(`   Files: ${r.file_count}`);
+            if (type === 'content matches') {
+                lines.push(`   Matches: ${r.matches}`);
+                r.lines.forEach((l) => lines.push(`      Line ${l.line}: ${l.content}`));
+            }
+        });
+        return lines.join('\n');
+    }
+    formatFileInfo(info) {
+        if (info.error)
+            return `[ERROR] ${info.error}`;
+        return `[OK] File Info:\nName: ${info.name}\nPath: ${info.path}\nSize: ${info.size} bytes\nCreated: ${info.created}\nModified: ${info.modified}`;
+    }
+    // ------------------------------------------------------------------------
+    // JSON extraction helpers
+    // ------------------------------------------------------------------------
+    extractJsonObjects(text) {
+        const objects = [];
+        const regex = /\{[\s\S]*?\}/g; // simple greedy match (may fail for nested)
+        let match;
+        while ((match = regex.exec(text)) !== null) {
+            try {
+                const obj = JSON.parse(match[0]);
+                objects.push(obj);
+            }
+            catch { /* ignore invalid JSON */ }
+        }
+        return objects;
+    }
+    removeJsonFromText(text) {
+        // Remove all JSON-like blocks (crude)
+        return text.replace(/\{[\s\S]*?\}/g, '').trim();
+    }
+    // ------------------------------------------------------------------------
+    // Cleanup
+    // ------------------------------------------------------------------------
+    dispose() {
+        // Nothing to clean up
     }
 }
 exports.Backend = Backend;

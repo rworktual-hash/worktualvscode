@@ -37,7 +37,7 @@ send({"status": "Backend ready"})
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-GEMINI_MODEL = "gemini-2.5-pro"
+GEMINI_MODEL = "gemini-3-pro-preview"
 
 
 # load_dotenv()
@@ -2049,6 +2049,64 @@ def main():
                     if not os.path.exists(WORKSPACE_PATH):
                         os.makedirs(WORKSPACE_PATH, exist_ok=True)
                     send_status(f"Workspace set to: {WORKSPACE_PATH}")
+                continue
+            
+            # Handle file operations from TypeScript backend
+            if data.get("type") == "file_operation":
+                action = data.get("action", "")
+                result = ""
+                
+                try:
+                    if action == "create_folder":
+                        result = create_folder(data.get("folder", ""))
+                    elif action == "create_project":
+                        result = create_project(data.get("folder", ""), data.get("files", []))
+                    elif action == "create_file":
+                        result = create_file(data.get("path", ""), data.get("content", ""), confirmed=True)
+                    elif action == "update_file":
+                        result = update_file(data.get("path", ""), data.get("content", ""), confirmed=True)
+                    elif action == "run_file":
+                        result = run_file(data.get("path", ""), data.get("environment", "none"))
+                    elif action == "search_files":
+                        results = find_files_by_keyword(
+                            data.get("keyword", ""), 
+                            data.get("file_type"), 
+                            data.get("max_results", 10)
+                        )
+                        result = format_search_results(results, "files")
+                    elif action == "search_folders":
+                        results = find_folders_by_keyword(
+                            data.get("keyword", ""), 
+                            data.get("max_results", 10)
+                        )
+                        result = format_search_results(results, "folders")
+                    elif action == "search_in_files":
+                        results = search_in_file_content(
+                            data.get("keyword", ""), 
+                            data.get("file_pattern", "*"), 
+                            data.get("max_results", 10)
+                        )
+                        result = format_search_results(results, "content matches")
+                    elif action == "get_file_info":
+                        info = get_file_info(data.get("path", ""))
+                        if "error" in info:
+                            result = f"[ERROR] {info['error']}"
+                        else:
+                            lines = ["[OK] File Information:"]
+                            lines.append("-" * 40)
+                            for key, value in info.items():
+                                if key != "full_path":
+                                    lines.append(f"{key.replace('_', ' ').title()}: {value}")
+                            result = "\n".join(lines)
+                    else:
+                        result = f"[ERROR] Unknown file operation: {action}"
+                    
+                    # Send result back
+                    send_response(result)
+                    
+                except Exception as e:
+                    send_error(f"File operation failed: {str(e)}")
+                
                 continue
             
             # Handle confirmation responses

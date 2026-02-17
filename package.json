@@ -2,7 +2,7 @@
   "name": "vibecoding",
   "displayName": "VibeCoding",
   "description": "AI coding assistant with code generation",
-  "version": "0.0.2",
+  "version": "0.0.9",
   "publisher": "vibe",
   "engines": {
     "vscode": "^1.80.0"
@@ -10,7 +10,9 @@
   "main": "./out/extension.js",
   "activationEvents": [
     "onView:vibecoding.chatView",
-    "onCommand:vibecoding.chat"
+    "onCommand:vibecoding.chat",
+    "onCommand:yourExtension.createFile",
+  "onStartupFinished"
   ],
   "categories": [
     "Other",

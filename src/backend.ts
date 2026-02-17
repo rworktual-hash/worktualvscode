@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import * as fs from 'fs';
 import * as https from 'https';
-import * as child_process from 'child_process'; // For running files
+import * as child_process from 'child_process';
+import * as fs from 'fs';
 
 
 export class Backend implements vscode.WebviewViewProvider {
@@ -14,9 +14,203 @@ export class Backend implements vscode.WebviewViewProvider {
     // Pending confirmation data (for file overwrite etc.)
     private pendingConfirmation: any = null;
 
+    // Python backend process
+    private pythonProcess?: child_process.ChildProcess;
+    private pythonReady: boolean = false;
+    private messageQueue: any[] = [];
+    private responseHandlers: Map<string, (response: any) => void> = new Map();
+
 
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
+        this.startPythonBackend();
+    }
+
+    /**
+     * Start the Python backend process for file operations
+     */
+    private startPythonBackend(): void {
+        const pythonScriptPath = path.join(this.context.extensionPath, 'python', 'backend.py');
+        
+        // Check if Python backend exists
+        if (!fs.existsSync(pythonScriptPath)) {
+            console.error('Python backend not found at:', pythonScriptPath);
+            return;
+        }
+
+        // Spawn Python process
+        this.pythonProcess = child_process.spawn('python', [pythonScriptPath], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            cwd: this.context.extensionPath
+        });
+
+        // Handle Python stdout (responses)
+        let buffer = '';
+        this.pythonProcess.stdout?.on('data', (data: Buffer) => {
+            buffer += data.toString();
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || ''; // Keep incomplete line in buffer
+            
+            for (const line of lines) {
+                if (line.trim()) {
+                    try {
+                        const response = JSON.parse(line);
+                        this.handlePythonResponse(response);
+                    } catch (e) {
+                        console.log('Python output:', line);
+                    }
+                }
+            }
+        });
+
+        // Handle Python stderr
+        this.pythonProcess.stderr?.on('data', (data: Buffer) => {
+            console.error('Python backend error:', data.toString());
+        });
+
+        // Handle Python process exit
+        this.pythonProcess.on('exit', (code) => {
+            console.log(`Python backend exited with code ${code}`);
+            this.pythonReady = false;
+            this.pythonProcess = undefined;
+        });
+
+        // Send workspace path configuration once ready
+        setTimeout(() => {
+            this.sendToPython({
+                type: 'config',
+                workspacePath: this.getWorkspaceRoot() || path.join(this.context.extensionPath, 'workspace')
+            });
+            this.pythonReady = true;
+            this.processMessageQueue();
+        }, 1000);
+    }
+
+    /**
+     * Send message to Python backend
+     */
+    private sendToPython(message: any): void {
+        if (this.pythonProcess && this.pythonProcess.stdin) {
+            this.pythonProcess.stdin.write(JSON.stringify(message) + '\n');
+        }
+    }
+
+    /**
+     * Process queued messages after Python is ready
+     */
+    private processMessageQueue(): void {
+        while (this.messageQueue.length > 0) {
+            const message = this.messageQueue.shift();
+            if (message) {
+                this.sendToPython(message);
+            }
+        }
+    }
+
+    /**
+     * Handle responses from Python backend
+     */
+    private handlePythonResponse(response: any): void {
+        // Handle ready signal
+        if (response.type === 'ready') {
+            this.pythonReady = true;
+            if (this.view) {
+                this.view.webview.postMessage({
+                    type: 'ready',
+                    text: response.text || 'Hello! What would you like to work on today?'
+                });
+            }
+            return;
+        }
+
+        // Handle status updates
+        if (response.type === 'status') {
+            if (this.view) {
+                this.view.webview.postMessage({
+                    type: 'status',
+                    text: response.text
+                });
+            }
+            return;
+        }
+
+        // Handle errors
+        if (response.type === 'error') {
+            if (this.view) {
+                this.view.webview.postMessage({
+                    type: 'error',
+                    text: response.text
+                });
+            }
+            return;
+        }
+
+        // Handle confirmation requests
+        if (response.type === 'confirmation') {
+            this.pendingConfirmation = response.action;
+            if (this.view) {
+                this.view.webview.postMessage({
+                    type: 'confirmation',
+                    text: response.text,
+                    action: response.action
+                });
+            }
+            return;
+        }
+
+        // Handle regular responses
+        if (response.type === 'response') {
+            if (this.view) {
+                this.view.webview.postMessage({
+                    type: 'response',
+                    text: response.text
+                });
+            }
+            return;
+        }
+
+        // Handle website complete
+        if (response.type === 'website_complete') {
+            if (this.view) {
+                this.view.webview.postMessage({
+                    type: 'website_complete',
+                    text: response.text,
+                    preview_url: response.preview_url,
+                    zip_url: response.zip_url
+                });
+            }
+            return;
+        }
+    }
+
+    /**
+     * Execute file operation via Python backend
+     */
+    private async executeFileOperation(action: string, data: any): Promise<string> {
+        return new Promise((resolve) => {
+            const messageId = Date.now().toString();
+            
+            // Set up response handler
+            this.responseHandlers.set(messageId, (response: any) => {
+                resolve(response.result || response.text || 'Operation completed');
+            });
+
+            // Send to Python
+            this.sendToPython({
+                type: 'file_operation',
+                id: messageId,
+                action: action,
+                ...data
+            });
+
+            // Timeout after 30 seconds
+            setTimeout(() => {
+                if (this.responseHandlers.has(messageId)) {
+                    this.responseHandlers.delete(messageId);
+                    resolve('[ERROR] Operation timed out');
+                }
+            }, 30000);
+        });
     }
 
 
@@ -44,25 +238,26 @@ export class Backend implements vscode.WebviewViewProvider {
     }
 
     private async createFileInWorkspace(relativePath: string, content: string): Promise<boolean> {
-        const workspaceRoot = this.validateWorkspace();
-        if (!workspaceRoot) return false;
-
-        try {
-            const fullPath = path.join(workspaceRoot, relativePath);
-            const fullDirPath = path.dirname(fullPath);
-
-            if (!fs.existsSync(fullDirPath)) {
-                fs.mkdirSync(fullDirPath, { recursive: true });
+        const result = await this.executeFileOperation('create_file', {
+            path: relativePath,
+            content: content
+        });
+        
+        // Open the file in the editor if successful
+        if (result.includes('[OK]') || result.includes('[CREATED]')) {
+            const workspaceRoot = this.getWorkspaceRoot();
+            if (workspaceRoot) {
+                const fullPath = path.join(workspaceRoot, relativePath);
+                try {
+                    await vscode.window.showTextDocument(vscode.Uri.file(fullPath), {
+                        viewColumn: vscode.ViewColumn.One,
+                        preserveFocus: false
+                    });
+                } catch (e) {
+                    // File might not exist yet, that's ok
+                }
             }
-
-            fs.writeFileSync(fullPath, content, 'utf8');
-
-            // Open the file in the editor
-            await vscode.window.showTextDocument(vscode.Uri.file(fullPath), {
-                viewColumn: vscode.ViewColumn.One,
-                preserveFocus: false
-            });
-
+            
             if (this.view) {
                 this.view.webview.postMessage({
                     type: 'status',
@@ -70,12 +265,11 @@ export class Backend implements vscode.WebviewViewProvider {
                 });
             }
             return true;
-        } catch (error) {
-            console.error('Failed to create file:', error);
+        } else {
             if (this.view) {
                 this.view.webview.postMessage({
                     type: 'error',
-                    text: `Failed to create file ${relativePath}: ${error}`
+                    text: result
                 });
             }
             return false;
@@ -479,7 +673,7 @@ export class Backend implements vscode.WebviewViewProvider {
         if (action.includes('create_folder') || action === 'createfolder') {
             const folder = actionData.folder || actionData.name;
             if (!folder) return '[ERROR] Missing folder name';
-            return this.createFolder(folder);
+            return await this.createFolder(folder);
         }
 
         // CREATE PROJECT (multiple files)
@@ -487,7 +681,7 @@ export class Backend implements vscode.WebviewViewProvider {
             const folder = actionData.folder || actionData.name || actionData.project;
             const files = actionData.files || [];
             if (!folder || !files.length) return '[ERROR] Missing folder name or files list';
-            return this.createProject(folder, files);
+            return await this.createProject(folder, files);
         }
 
         // CREATE FILE
@@ -495,7 +689,7 @@ export class Backend implements vscode.WebviewViewProvider {
             const filePath = actionData.path || actionData.filename || actionData.file;
             const content = actionData.content || '';
             if (!filePath) return '[ERROR] Missing file path';
-            return this.createFile(filePath, content);
+            return await this.createFile(filePath, content);
         }
 
         // UPDATE FILE
@@ -503,7 +697,7 @@ export class Backend implements vscode.WebviewViewProvider {
             const filePath = actionData.path || actionData.filename || actionData.file;
             const content = actionData.content || '';
             if (!filePath) return '[ERROR] Missing file path';
-            return this.updateFile(filePath, content);
+            return await this.updateFile(filePath, content);
         }
 
         // DEBUG FILE (auto-fix) – same as update_file for now
@@ -511,7 +705,7 @@ export class Backend implements vscode.WebviewViewProvider {
             const filePath = actionData.path || actionData.filename || actionData.file;
             const content = actionData.content || '';
             if (!filePath) return '[ERROR] Missing file path';
-            return this.updateFile(filePath, content);
+            return await this.updateFile(filePath, content);
         }
 
         // RUN FILE
@@ -519,7 +713,7 @@ export class Backend implements vscode.WebviewViewProvider {
             const filePath = actionData.path || actionData.filename || actionData.file;
             const environment = actionData.environment || 'none';
             if (!filePath) return '[ERROR] Missing file path';
-            return this.runFile(filePath, environment);
+            return await this.runFile(filePath, environment);
         }
 
         // SEARCH FILES
@@ -528,7 +722,7 @@ export class Backend implements vscode.WebviewViewProvider {
             const fileType = actionData.file_type || actionData.extension;
             const maxResults = actionData.max_results || 10;
             if (!keyword) return '[ERROR] Missing search keyword';
-            const results = this.searchFiles(keyword, fileType, maxResults);
+            const results = await this.searchFiles(keyword, fileType, maxResults);
             return this.formatSearchResults(results, 'files');
         }
 
@@ -537,7 +731,7 @@ export class Backend implements vscode.WebviewViewProvider {
             const keyword = actionData.keyword || actionData.search || actionData.query;
             const maxResults = actionData.max_results || 10;
             if (!keyword) return '[ERROR] Missing search keyword';
-            const results = this.searchFolders(keyword, maxResults);
+            const results = await this.searchFolders(keyword, maxResults);
             return this.formatSearchResults(results, 'folders');
         }
 
@@ -547,7 +741,7 @@ export class Backend implements vscode.WebviewViewProvider {
             const filePattern = actionData.file_pattern || actionData.pattern || '*';
             const maxResults = actionData.max_results || 10;
             if (!keyword) return '[ERROR] Missing search keyword';
-            const results = this.searchInFiles(keyword, filePattern, maxResults);
+            const results = await this.searchInFiles(keyword, filePattern, maxResults);
             return this.formatSearchResults(results, 'content matches');
         }
 
@@ -555,7 +749,7 @@ export class Backend implements vscode.WebviewViewProvider {
         if (action.includes('get_file_info') || action === 'getfileinfo' || action === 'file_info') {
             const filePath = actionData.path || actionData.file || actionData.filename;
             if (!filePath) return '[ERROR] Missing file path';
-            const info = this.getFileInfo(filePath);
+            const info = await this.getFileInfo(filePath);
             return this.formatFileInfo(info);
         }
 
@@ -566,280 +760,201 @@ export class Backend implements vscode.WebviewViewProvider {
     // File system action implementations (ported from original Python)
     // ------------------------------------------------------------------------
 
-    private createFolder(folder: string): string {
-        const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) return '[ERROR] No workspace open';
-        const fullPath = path.join(workspaceRoot, folder);
-        try {
-            if (fs.existsSync(fullPath)) {
-                return `[INFO] Folder '${fullPath}' already exists.`;
-            }
-            fs.mkdirSync(fullPath, { recursive: true });
-            return `[OK] Folder '${fullPath}' created.`;
-        } catch (err) {
-            return `[ERROR] ${err}`;
-        }
+    private async createFolder(folder: string): Promise<string> {
+        return await this.executeFileOperation('create_folder', {
+            folder: folder
+        });
     }
 
-    private createProject(folder: string, files: Array<{ path: string; content: string }>): string {
-        const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) return '[ERROR] No workspace open';
-        const projectPath = path.join(workspaceRoot, folder);
-        const results: string[] = [];
-
-        try {
-            if (!fs.existsSync(projectPath)) {
-                fs.mkdirSync(projectPath, { recursive: true });
-                results.push(`[OK] Created project folder: ${projectPath}`);
-            } else {
-                results.push(`[INFO] Project folder '${folder}' already exists.`);
-            }
-
-            let created = 0, updated = 0, errors = 0;
-            for (const file of files) {
-                try {
-                    const relPath = file.path;
-                    const fullPath = path.join(projectPath, relPath);
-                    const parentDir = path.dirname(fullPath);
-                    if (!fs.existsSync(parentDir)) {
-                        fs.mkdirSync(parentDir, { recursive: true });
-                    }
-                    const exists = fs.existsSync(fullPath);
-                    fs.writeFileSync(fullPath, file.content, 'utf8');
-                    const displayPath = path.join(folder, relPath);
-                    if (exists) {
-                        results.push(`[UPDATED] ${displayPath}`);
-                        updated++;
-                    } else {
-                        results.push(`[CREATED] ${displayPath}`);
-                        created++;
-                    }
-                } catch (e) {
-                    results.push(`[ERROR] Failed to create ${file.path}: ${e}`);
-                    errors++;
-                }
-            }
-            results.push(`[SUMMARY] Created: ${created}, Updated: ${updated}, Errors: ${errors}`);
-            return results.join('\n');
-        } catch (err) {
-            return `[ERROR] Failed to create project: ${err}`;
-        }
+    private async createProject(folder: string, files: Array<{ path: string; content: string }>): Promise<string> {
+        return await this.executeFileOperation('create_project', {
+            folder: folder,
+            files: files
+        });
     }
 
-    private createFile(filePath: string, content: string): string {
-        const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) return '[ERROR] No workspace open';
-        const fullPath = path.join(workspaceRoot, filePath);
-
-        // Check if file already exists (simple check)
-        if (fs.existsSync(fullPath)) {
-            // Ask for confirmation (store pending and return confirmation request)
-            this.pendingConfirmation = {
-                action: 'create_file',
-                path: filePath,
-                content: content
-            };
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'confirmation',
-                    text: `File '${filePath}' already exists. Overwrite? (yes/no)`,
-                    action: this.pendingConfirmation
-                });
-            }
-            return `[CONFIRMATION_REQUIRED] File exists. Waiting for user response.`;
-        }
-
-        try {
-            const dir = path.dirname(fullPath);
-            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            fs.writeFileSync(fullPath, content, 'utf8');
-            // Open file
-            vscode.window.showTextDocument(vscode.Uri.file(fullPath));
-            return `[OK] Created: ${filePath}`;
-        } catch (err) {
-            return `[ERROR] ${err}`;
-        }
+    private async createFile(filePath: string, content: string): Promise<string> {
+        return await this.executeFileOperation('create_file', {
+            path: filePath,
+            content: content
+        });
     }
 
-    private updateFile(filePath: string, content: string): string {
-        const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) return '[ERROR] No workspace open';
-        const fullPath = path.join(workspaceRoot, filePath);
-
-        if (!fs.existsSync(fullPath)) {
-            // File doesn't exist – ask to create?
-            this.pendingConfirmation = {
-                action: 'update_file',
-                path: filePath,
-                content: content
-            };
-            if (this.view) {
-                this.view.webview.postMessage({
-                    type: 'confirmation',
-                    text: `File '${filePath}' does not exist. Create it? (yes/no)`,
-                    action: this.pendingConfirmation
-                });
-            }
-            return `[CONFIRMATION_REQUIRED] File not found.`;
-        }
-
-        try {
-            fs.writeFileSync(fullPath, content, 'utf8');
-            return `[OK] Updated: ${filePath}`;
-        } catch (err) {
-            return `[ERROR] ${err}`;
-        }
+    private async updateFile(filePath: string, content: string): Promise<string> {
+        return await this.executeFileOperation('update_file', {
+            path: filePath,
+            content: content
+        });
     }
 
-    private runFile(filePath: string, environment: string): string {
-        const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) return '[ERROR] No workspace open';
-        const fullPath = path.join(workspaceRoot, filePath);
-
-        if (!fs.existsSync(fullPath)) {
-            return `[ERROR] File '${filePath}' not found.`;
-        }
-
-        // Simple execution based on extension
-        let command: string;
-        if (filePath.endsWith('.py')) {
-            command = `python "${fullPath}"`;
-        } else if (filePath.endsWith('.js')) {
-            command = `node "${fullPath}"`;
-        } else if (filePath.endsWith('.sh')) {
-            command = `bash "${fullPath}"`;
-        } else {
-            return `[ERROR] Unsupported file type for execution.`;
-        }
-
-        try {
-            const output = child_process.execSync(command, { encoding: 'utf8', timeout: 10000 });
-            return `[RUN] Output:\n${output}`;
-        } catch (err: any) {
-            return `[ERROR] Execution failed:\n${err.stderr || err.message}`;
-        }
+    private async runFile(filePath: string, environment: string): Promise<string> {
+        return await this.executeFileOperation('run_file', {
+            path: filePath,
+            environment: environment
+        });
     }
 
     // ------------------------------------------------------------------------
     // Search methods (simplified versions)
     // ------------------------------------------------------------------------
 
-    private searchFiles(keyword: string, fileType?: string, maxResults: number = 10): any[] {
-        const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) return [{ error: 'No workspace open' }];
-        const results: any[] = [];
-        const walk = (dir: string) => {
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
-            for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                    if (!entry.name.startsWith('.') && entry.name !== 'node_modules' && entry.name !== '__pycache__') {
-                        walk(fullPath);
+    private async searchFiles(keyword: string, fileType?: string, maxResults: number = 10): Promise<any[]> {
+        const result = await this.executeFileOperation('search_files', {
+            keyword: keyword,
+            file_type: fileType,
+            max_results: maxResults
+        });
+        
+        // Parse the result string to extract file information
+        try {
+            // Try to extract JSON from the result
+            const lines = result.split('\n');
+            const files: any[] = [];
+            let currentFile: any = null;
+            
+            for (const line of lines) {
+                if (line.match(/^\d+\./)) {
+                    // New file entry
+                    if (currentFile) {
+                        files.push(currentFile);
                     }
-                } else {
-                    if (entry.name.toLowerCase().includes(keyword.toLowerCase())) {
-                        if (fileType && !entry.name.endsWith(fileType)) continue;
-                        results.push({
-                            name: entry.name,
-                            path: path.relative(workspaceRoot, fullPath),
-                            size: fs.statSync(fullPath).size,
-                            modified: new Date(fs.statSync(fullPath).mtime).toLocaleString()
+                    const name = line.replace(/^\d+\.\s*/, '').trim();
+                    currentFile = { name: name, path: '', size: 0, modified: '' };
+                } else if (line.includes('Path:') && currentFile) {
+                    currentFile.path = line.replace(/.*Path:\s*/, '').trim();
+                } else if (line.includes('Size:') && currentFile) {
+                    const sizeMatch = line.match(/Size:\s*(\d+)/);
+                    if (sizeMatch) {
+                        currentFile.size = parseInt(sizeMatch[1]);
+                    }
+                } else if (line.includes('Modified:') && currentFile) {
+                    currentFile.modified = line.replace(/.*Modified:\s*/, '').trim();
+                }
+            }
+            
+            if (currentFile) {
+                files.push(currentFile);
+            }
+            
+            return files.length > 0 ? files : [{ error: 'No files found' }];
+        } catch (e) {
+            return [{ error: 'Failed to parse search results' }];
+        }
+    }
+
+    private async searchFolders(keyword: string, maxResults: number = 10): Promise<any[]> {
+        const result = await this.executeFileOperation('search_folders', {
+            keyword: keyword,
+            max_results: maxResults
+        });
+        
+        // Parse the result string to extract folder information
+        try {
+            const lines = result.split('\n');
+            const folders: any[] = [];
+            let currentFolder: any = null;
+            
+            for (const line of lines) {
+                if (line.match(/^\d+\./)) {
+                    // New folder entry
+                    if (currentFolder) {
+                        folders.push(currentFolder);
+                    }
+                    const name = line.replace(/^\d+\.\s*/, '').replace(/\/$/, '').trim();
+                    currentFolder = { name: name, path: '', file_count: 0 };
+                } else if (line.includes('Path:') && currentFolder) {
+                    currentFolder.path = line.replace(/.*Path:\s*/, '').replace(/\/$/, '').trim();
+                } else if (line.includes('Files:') && currentFolder) {
+                    const countMatch = line.match(/Files:\s*(\d+)/);
+                    if (countMatch) {
+                        currentFolder.file_count = parseInt(countMatch[1]);
+                    }
+                }
+            }
+            
+            if (currentFolder) {
+                folders.push(currentFolder);
+            }
+            
+            return folders.length > 0 ? folders : [{ error: 'No folders found' }];
+        } catch (e) {
+            return [{ error: 'Failed to parse search results' }];
+        }
+    }
+
+    private async searchInFiles(keyword: string, filePattern: string = '*', maxResults: number = 10): Promise<any[]> {
+        const result = await this.executeFileOperation('search_in_files', {
+            keyword: keyword,
+            file_pattern: filePattern,
+            max_results: maxResults
+        });
+        
+        // Parse the result string to extract content matches
+        try {
+            const lines = result.split('\n');
+            const matches: any[] = [];
+            let currentMatch: any = null;
+            
+            for (const line of lines) {
+                if (line.match(/^\d+\./)) {
+                    // New match entry
+                    if (currentMatch) {
+                        matches.push(currentMatch);
+                    }
+                    const name = line.replace(/^\d+\.\s*/, '').trim();
+                    currentMatch = { name: name, path: '', matches: 0, lines: [] };
+                } else if (line.includes('Path:') && currentMatch) {
+                    currentMatch.path = line.replace(/.*Path:\s*/, '').trim();
+                } else if (line.includes('Matches:') && currentMatch) {
+                    const countMatch = line.match(/Matches:\s*(\d+)/);
+                    if (countMatch) {
+                        currentMatch.matches = parseInt(countMatch[1]);
+                    }
+                } else if (line.includes('Line') && currentMatch) {
+                    const lineMatch = line.match(/Line\s+(\d+):\s*(.+)/);
+                    if (lineMatch) {
+                        currentMatch.lines.push({
+                            line: parseInt(lineMatch[1]),
+                            content: lineMatch[2]
                         });
-                        if (results.length >= maxResults) return;
                     }
                 }
             }
-        };
-        walk(workspaceRoot);
-        return results;
+            
+            if (currentMatch) {
+                matches.push(currentMatch);
+            }
+            
+            return matches.length > 0 ? matches : [{ error: 'No matches found' }];
+        } catch (e) {
+            return [{ error: 'Failed to parse search results' }];
+        }
     }
 
-    private searchFolders(keyword: string, maxResults: number = 10): any[] {
-        const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) return [{ error: 'No workspace open' }];
-        const results: any[] = [];
-        const walk = (dir: string) => {
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
-            for (const entry of entries) {
-                if (entry.isDirectory()) {
-                    const fullPath = path.join(dir, entry.name);
-                    if (entry.name.toLowerCase().includes(keyword.toLowerCase())) {
-                        results.push({
-                            name: entry.name,
-                            path: path.relative(workspaceRoot, fullPath),
-                            file_count: fs.readdirSync(fullPath).length
-                        });
-                        if (results.length >= maxResults) return;
-                    }
-                    if (!entry.name.startsWith('.') && entry.name !== 'node_modules' && entry.name !== '__pycache__') {
-                        walk(fullPath);
+    private async getFileInfo(filePath: string): Promise<any> {
+        const result = await this.executeFileOperation('get_file_info', {
+            path: filePath
+        });
+        
+        // Parse the result string to extract file information
+        try {
+            const lines = result.split('\n');
+            const info: any = {};
+            
+            for (const line of lines) {
+                if (line.includes(':')) {
+                    const [key, value] = line.split(':').map(s => s.trim());
+                    if (key && value) {
+                        const normalizedKey = key.toLowerCase().replace(/\s+/g, '_');
+                        info[normalizedKey] = value;
                     }
                 }
             }
-        };
-        walk(workspaceRoot);
-        return results;
-    }
-
-    private searchInFiles(keyword: string, filePattern: string = '*', maxResults: number = 10): any[] {
-        const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) return [{ error: 'No workspace open' }];
-        const results: any[] = [];
-        const textExtensions = ['.py', '.js', '.ts', '.html', '.css', '.json', '.md', '.txt', '.xml', '.yaml', '.yml'];
-        const walk = (dir: string) => {
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
-            for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                    if (!entry.name.startsWith('.') && entry.name !== 'node_modules' && entry.name !== '__pycache__') {
-                        walk(fullPath);
-                    }
-                } else {
-                    const ext = path.extname(entry.name).toLowerCase();
-                    if (!textExtensions.includes(ext)) continue;
-                    if (filePattern !== '*' && !entry.name.includes(filePattern.replace('*', ''))) continue;
-
-                    try {
-                        const content = fs.readFileSync(fullPath, 'utf8');
-                        const lines = content.split('\n');
-                        const matches: any[] = [];
-                        for (let i = 0; i < lines.length; i++) {
-                            if (lines[i].toLowerCase().includes(keyword.toLowerCase())) {
-                                matches.push({ line: i + 1, content: lines[i].trim().substring(0, 100) });
-                                if (matches.length >= 3) break;
-                            }
-                        }
-                        if (matches.length > 0) {
-                            results.push({
-                                name: entry.name,
-                                path: path.relative(workspaceRoot, fullPath),
-                                matches: matches.length,
-                                lines: matches
-                            });
-                            if (results.length >= maxResults) return;
-                        }
-                    } catch (e) { /* ignore unreadable */ }
-                }
-            }
-        };
-        walk(workspaceRoot);
-        return results;
-    }
-
-    private getFileInfo(filePath: string): any {
-        const workspaceRoot = this.getWorkspaceRoot();
-        if (!workspaceRoot) return { error: 'No workspace open' };
-        const fullPath = path.join(workspaceRoot, filePath);
-        if (!fs.existsSync(fullPath)) return { error: 'File not found' };
-        const stat = fs.statSync(fullPath);
-        return {
-            name: path.basename(fullPath),
-            path: path.relative(workspaceRoot, fullPath),
-            size: stat.size,
-            created: stat.birthtime.toLocaleString(),
-            modified: stat.mtime.toLocaleString(),
-            isDirectory: stat.isDirectory()
-        };
+            
+            return info.name ? info : { error: 'Failed to parse file info' };
+        } catch (e) {
+            return { error: 'Failed to parse file info' };
+        }
     }
 
     private formatSearchResults(results: any[], type: string): string {
@@ -890,9 +1005,14 @@ export class Backend implements vscode.WebviewViewProvider {
     // ------------------------------------------------------------------------
 
     public dispose(): void {
-        // Nothing to clean up
+        // Clean up Python backend process
+        if (this.pythonProcess) {
+            this.sendToPython({ type: 'exit' });
+            setTimeout(() => {
+                if (this.pythonProcess && !this.pythonProcess.killed) {
+                    this.pythonProcess.kill();
+                }
+            }, 1000);
+        }
     }
 }
-
-
-

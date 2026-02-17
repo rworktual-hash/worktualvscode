@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+    <div class="results-container">
+        <h1>Results for "{{ election.title }}"</h1>
+        <p class="election-description">{{ election.description }}</p>
+
+        {% if total_votes > 0 %}
+            <p>Total Votes Cast: {{ total_votes }}</p>
+            <ul class="vote-results-list">
+                {% for candidate_name, count in results.items() %}
+                    <li>
+                        <strong>{{ candidate_name }}:</strong> {{ count }} votes 
+                        {% if total_votes > 0 %}
+                            ({{ "%.2f" | format((count / total_votes) * 100) }}%)
+                        {% endif %}
+                    </li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <div class="alert alert-info">No votes have been cast in this election yet.</div>
+        {% endif %}
+        <br>
+        <a href="{{ url_for('election_detail', election_id=election.id) }}" class="btn btn-secondary">Back to Election Details</a>
+        <a href="{{ url_for('index') }}" class="btn btn-secondary">Back to Elections List</a>
+    </div>
+{% endblock %}

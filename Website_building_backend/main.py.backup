@@ -1,0 +1,2492 @@
+import os
+import re
+import json
+import shutil
+import zipfile
+import logging
+import subprocess
+import asyncio
+import uuid 
+from typing import Dict, Any, List, Tuple
+import glob
+import json
+import os
+import re
+import shutil
+import time
+import asyncio
+import time
+from datetime import datetime
+from typing import List, Dict, Any
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from google import genai
+from starlette.middleware.cors import CORSMiddleware
+from chat_manager import ChatManager
+import subprocess, os, json, logging, shutil
+
+# from flask import Flask
+# # from flask_cors importCORS 
+# gemini-3-pro-preview
+# app = Flask(__name__)
+#   # Enable CORS for all routes/methods from your frontend origin
+#  CORS(app, resources={r"/api/*": {"origins": "https://advancecoding.wortual.co.uk"}}) 
+#  @app.route("/api/chat", methods=["POST", "OPTIONS"]) 
+#  def chat():
+#   # ... your chat logic ... 
+#   return{"response": "Hello from Python!"}
+app = FastAPI(title="WORTUAL ADVANCE CODING BACKEND")
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ai-site-generator")
+
+API_KEY = os.getenv("GEMINI_API_KEY")
+if not API_KEY:
+ logger.warning("GEMINI_API_KEY not found. Generation will not work.")
+ client = None
+else:
+ try:
+  client = genai.Client(api_key=API_KEY)
+ except Exception as e:
+  logger.error(f"Failed to initialize Gemini client: {e}")
+  client = None
+
+CODE_GEN_MODEL = os.getenv("GEMINI_CODE_MODEL", "gemini-2.5-pro")
+CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", CODE_GEN_MODEL)
+
+APP_HOST = os.getenv("APP_HOST", "http://192.168.13.107:8000")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://192.168.13.107:5175")
+
+
+origins = [
+    "http://192.168.13.107:8000", # backend domain itself
+    FRONTEND_ORIGIN,  # local frontend
+    "http://localhost:5173",  # Vite dev server
+    "http://localhost:3000",  # Common dev server
+    "http://192.168.13.107:5175",  # Specific dev server
+    "http://192.168.13.107:5173",  # Vite default
+    "http://192.168.13.107:3000",   # Common dev server
+    "http://localhost:5173"   # Added for local development
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],  # or ["GET", "POST", "OPTIONS"]
+    allow_headers=["*"],
+)
+
+# --- MODIFIED: Dynamic & Relative Path Configuration (FIXED BUG) ---
+# CRITICAL: Removed os.path.abspath() so these folders are created 
+# relative to where you run main.py (inside your ATLAS_3/backend directory).
+BASE_PATH = "/home/vectone/Documents/advancecoding_data"  # Fixed absolute path for data storage
+
+PROJECTS_BASE_DIR = os.path.join(BASE_PATH, "user_projects")
+PROJECTS_ZIPS_DIR = os.path.join(BASE_PATH, "generated_zips")
+TEMP_UPLOAD_DIR = os.path.join(BASE_PATH, "temp_uploads")
+
+
+
+# --- MODIFIED: Create all base directories on startup ---
+os.makedirs(PROJECTS_BASE_DIR, exist_ok=True)
+os.makedirs(PROJECTS_ZIPS_DIR, exist_ok=True)
+os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+
+# --- GLOBAL STATE ---
+generation_state: Dict[str, Dict[str, Any]] = {}
+chat_context: Dict[str, Any] = {'history': []} 
+current_project_info: Dict[str, str] = {}
+MAX_HISTORY_MESSAGES = 10
+
+# Initialize ChatManager
+chat_manager = ChatManager(API_KEY, CHAT_MODEL)
+
+
+# --- UTILITY FUNCTIONS ---
+
+
+
+def safe_json_parse(text: str):
+  """
+  Safely parses AI output into JSON.
+  Handles markdown fences, extra text, and partial responses gracefully.
+  Returns None if parsing completely fails.
+  """
+  if not text or not isinstance(text, str):
+    logger.error("safe_json_parse called with invalid text input.")
+    return None
+
+  # --- 1. Direct JSON parse attempt ---
+  try:
+    return json.loads(text)
+  except json.JSONDecodeError:
+    pass # Try cleanup fallback below
+
+  # --- 2. Clean code fences and markdown artifacts ---
+  cleaned = re.sub(r"```(?:json|javascript)?|```", "", text, flags=re.IGNORECASE).strip()
+
+  # --- 3. Remove any "explanation" or extra text before/after the JSON ---
+  # Find the first '{' and last '}' and slice between them
+  start = cleaned.find("{")
+  end = cleaned.rfind("}")
+  if start != -1 and end != -1 and end > start:
+    candidate = cleaned[start:end + 1]
+    try:
+      return json.loads(candidate)
+    except json.JSONDecodeError:
+      pass
+
+  # --- 4. Try last-resort pattern match for JSON-like content ---
+  match = re.search(r"\{[\s\S]*\}", cleaned)
+  if match:
+    snippet = match.group(0)
+    try:
+      return json.loads(snippet)
+    except Exception as e:
+      logger.error(f"Final JSON parse attempt failed: {e}")
+
+  # --- 5. Log failure context ---
+  logger.error(" safe_json_parse: All parsing attempts failed. Output sample:")
+  logger.error(text[:500]) # log first 500 chars for debugging
+
+  return None
+
+def run_npm_build(base_dir: str):
+  """
+  Self-healing npm build for React/Vite projects.
+  Automatically fixes missing config, dependencies, and logs full output.
+  """
+  project_dist_dir = os.path.join(base_dir, "dist")
+  package_json_path = os.path.join(base_dir, "package.json")
+  log_path = os.path.join(base_dir, "build.log")
+  vite_config_path = os.path.join(base_dir, "vite.config.js")
+
+  def write_log(text):
+    with open(log_path, "a", encoding="utf-8") as f:
+      f.write(f"\n{text}\n")
+
+  def run_command(cmd, cwd, step_name):
+    try:
+      logger.info(f" Running {step_name}: {' '.join(cmd)}")
+      result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        timeout=240
+      )
+      write_log(f"\n==== {step_name} SUCCESS ====\n{result.stdout}")
+      return True
+    except subprocess.CalledProcessError as e:
+      write_log(f"\n==== {step_name} FAILED ====\n{e.stdout}")
+      logger.error(f"{step_name} failed:\n{e.stdout}")
+      return False
+    except subprocess.TimeoutExpired:
+      write_log(f"\n==== {step_name} TIMEOUT ====")
+      logger.error(f"{step_name} timed out.")
+      return False
+    except Exception as e:
+      logger.exception(f"Unexpected error during {step_name}: {e}")
+      write_log(f"\nUnexpected error during {step_name}: {e}")
+      return False
+
+  try:
+    # --- Ensure package.json exists ---
+    if not os.path.exists(package_json_path):
+      logger.error(f"No package.json found in {base_dir}")
+      write_log("Error: Missing package.json")
+      return False
+
+    with open(package_json_path, "r+", encoding="utf-8") as f:
+      pkg = json.load(f)
+      scripts = pkg.get("scripts", {})
+      deps = pkg.get("dependencies", {})
+      dev_deps = pkg.get("devDependencies", {})
+
+      # --- Ensure build script exists ---
+      if "build" not in scripts:
+        scripts["build"] = "vite build"
+        logger.warning("Added missing 'build' script to package.json")
+
+      # --- Ensure core dependencies ---
+      required = {
+        "react": "^18.2.0",
+        "react-dom": "^18.2.0",
+        "vite": "^5.0.0",
+        "@vitejs/plugin-react": "^4.0.0"
+      }
+      updated = False
+      for k, v in required.items():
+        if k not in deps and k not in dev_deps:
+          deps[k] = v
+          updated = True
+      if updated:
+        logger.info("Added missing dependencies for React/Vite.")
+
+      pkg["scripts"] = scripts
+      pkg["dependencies"] = deps
+      f.seek(0)
+      json.dump(pkg, f, indent=2)
+      f.truncate()
+
+    # --- Ensure vite.config.js exists ---
+    if not os.path.exists(vite_config_path):
+      vite_config = """
+     import { defineConfig } from 'vite';
+     import react from '@vitejs/plugin-react';
+     export default defineConfig({
+      plugins: [react()],
+      build: { outDir: 'dist' },
+      server: { port: 5173 }
+     });
+"""
+      with open(vite_config_path, "w", encoding="utf-8") as vf:
+        vf.write(vite_config)
+      logger.info(" Added default vite.config.js")
+
+    # --- npm install ---
+    node_modules_path = os.path.join(base_dir, "node_modules")
+    if not os.path.exists(node_modules_path):
+      if not run_command(["npm", "install"], base_dir, "npm install"):
+        write_log("npm install failed.")
+        return False
+
+    # --- npm run build ---
+    if not run_command(["npm", "run", "build"], base_dir, "npm build"):
+      logger.error(" Build failed. See build.log for details.")
+      return False
+
+    # --- Verify build output ---
+    if os.path.exists(project_dist_dir):
+      logger.info(f" Build completed successfully! Output: {project_dist_dir}")
+      write_log("Build successful.")
+      return True
+    else:
+      write_log(" Build finished but no dist directory found.")
+      return False
+
+  except Exception as e:
+    logger.exception(f"Critical error during npm build: {e}")
+    write_log(f"Critical error during npm build: {e}")
+    return False
+
+
+
+def zip_directory(src_dir: str, zip_path: str):
+ # MODIFIED: Ensure zip_path directory exists
+ os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+ 
+ if os.path.exists(zip_path):
+  os.remove(zip_path)
+ with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+  for root, _, files in os.walk(src_dir):
+   for file in files:
+    full_path = os.path.join(root, file)
+    arc_name = os.path.relpath(full_path, src_dir)
+    zipf.write(full_path, arcname=arc_name)
+
+import subprocess, os, logging, json
+
+logger = logging.getLogger("ai-site-generator")
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+import os
+import json
+import subprocess
+import logging
+from typing import Dict
+
+# Configure logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def run_npm_build(base_dir: str, env: Dict[str, str] = None, max_retries: int = 2):
+  """
+  Self-healing npm build for React/Vite projects.
+  Automatically fixes missing config, dependencies, and logs full output.
+  Supports retries and environment variables.
+  """
+  project_dist_dir = os.path.join(base_dir, "dist")
+  package_json_path = os.path.join(base_dir, "package.json")
+  log_path = os.path.join(base_dir, "build.log")
+  vite_config_path = os.path.join(base_dir, "vite.config.js")
+
+  env = env or os.environ.copy()
+  env.setdefault("NODE_OPTIONS", "--max-old-space-size=4096") # Prevent memory issues
+
+  def write_log(text: str):
+    with open(log_path, "a", encoding="utf-8") as f:
+      f.write(f"[{os.path.basename(base_dir)}] {text}\n")
+
+  def run_command(cmd, cwd, step_name):
+    try:
+      logger.info(f" Running {step_name}: {' '.join(cmd)}")
+      result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+        env=env
+      )
+      write_log(f"\n==== {step_name} SUCCESS ====\n{result.stdout}")
+      return True
+    except subprocess.CalledProcessError as e:
+      write_log(f"\n==== {step_name} FAILED ====\n{e.stdout}")
+      logger.error(f"{step_name} failed:\n{e.stdout}")
+      return False
+    except subprocess.TimeoutExpired:
+      write_log(f"\n==== {step_name} TIMEOUT ====")
+      logger.error(f"{step_name} timed out.")
+      return False
+    except Exception as e:
+      write_log(f"\n==== {step_name} ERROR ====\n{e}")
+      logger.exception(f"Unexpected error during {step_name}: {e}")
+      return False
+
+  try:
+    # --- Ensure package.json exists ---
+    if not os.path.exists(package_json_path):
+      logger.error(f"No package.json found in {base_dir}")
+      write_log("Error: Missing package.json")
+      return False
+
+    with open(package_json_path, "r+", encoding="utf-8") as f:
+      pkg = json.load(f)
+      scripts = pkg.get("scripts", {})
+      deps = pkg.get("dependencies", {})
+      dev_deps = pkg.get("devDependencies", {})
+
+      # --- Ensure build script exists ---
+      if "build" not in scripts:
+        scripts["build"] = "vite build"
+        logger.warning("Added missing 'build' script to package.json")
+
+      # --- Ensure core dependencies ---
+      required = {
+        "react": "^18.2.0",
+        "react-dom": "^18.2.0",
+        "vite": "^5.0.0",
+        "@vitejs/plugin-react": "^4.0.0"
+      }
+      updated = False
+      for k, v in required.items():
+        if k not in deps and k not in dev_deps:
+          deps[k] = v
+          updated = True
+      if updated:
+        logger.info("Added missing dependencies for React/Vite.")
+
+      pkg["scripts"] = scripts
+      pkg["dependencies"] = deps
+      f.seek(0)
+      json.dump(pkg, f, indent=2)
+      f.truncate()
+
+    # --- Ensure vite.config.js exists ---
+    if not os.path.exists(vite_config_path):
+      vite_config = """import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({
+ plugins: [react()],
+ build: { outDir: 'dist' },
+ server: { port: 5173 }
+});
+"""
+      with open(vite_config_path, "w", encoding="utf-8") as vf:
+        vf.write(vite_config)
+      logger.info(" Added default vite.config.js")
+
+    # --- npm install with retries ---
+    node_modules_path = os.path.join(base_dir, "node_modules")
+    if not os.path.exists(node_modules_path):
+      for attempt in range(max_retries):
+        if run_command(["npm", "install"], base_dir, f"npm install (attempt {attempt+1})"):
+          break
+      else:
+        write_log("npm install failed after retries.")
+        return False
+
+    # --- npm run build with retries ---
+    for attempt in range(max_retries):
+      if run_command(["npm", "run", "build"], base_dir, f"npm build (attempt {attempt+1})"):
+        break
+    else:
+      write_log("Build failed after retries.")
+      logger.error(" Build failed. Check build.log for details.")
+      return False
+
+    # --- Verify build output ---
+    if os.path.exists(project_dist_dir):
+      logger.info(f" Build completed successfully! Output: {project_dist_dir}")
+      write_log("Build successful.")
+      return True
+    else:
+      write_log(" Build finished but no dist directory found.")
+      return False
+
+  except Exception as e:
+    logger.exception(f"Critical error during npm build: {e}")
+    write_log(f"Critical error during npm build: {e}")
+    return False
+
+
+def read_current_project_files(base_dir: str, max_file_size_mb: int = 5) -> Dict[str, str]:
+  """
+  Reads all text-based files from a project directory for editing.
+  Skips binary files, ignored dirs, and files larger than max_file_size_mb.
+  """
+  files_content = {}
+  if not os.path.exists(base_dir):
+    return files_content
+
+  ignore_dirs = {".git", "node_modules", "dist"}
+  ignore_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico", ".zip", ".lock", ".pdf", ".mp4"}
+
+  for root, dirs, files in os.walk(base_dir):
+    dirs[:] = [d for d in dirs if d not in ignore_dirs]
+    for file in files:
+      full_path = os.path.join(root, file)
+      rel_path = os.path.relpath(full_path, base_dir)
+      if any(rel_path.lower().endswith(ext) for ext in ignore_exts):
+        continue
+      if os.path.getsize(full_path) > max_file_size_mb * 1024 * 1024:
+        logger.warning(f"Skipping large file {rel_path}")
+        continue
+      try:
+        with open(full_path, 'r', encoding='utf-8') as f:
+          files_content[rel_path] = f.read()
+      except UnicodeDecodeError:
+        logger.warning(f"Skipping binary or non-text file {rel_path}")
+      except Exception as e:
+        logger.warning(f"Could not read file {rel_path}: {e}")
+
+  return files_content
+
+
+def read_current_project_files(base_dir: str, max_file_size_mb: int = 5) -> Dict[str, str]:
+  """
+  Reads all text-based files from a project directory for editing.
+  Skips binary files, ignored dirs, and files larger than max_file_size_mb.
+  """
+  files_content = {}
+  if not os.path.exists(base_dir):
+    return files_content
+
+  ignore_dirs = {".git", "node_modules", "dist"}
+  ignore_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico", ".zip", ".lock", ".pdf", ".mp4"}
+
+  for root, dirs, files in os.walk(base_dir):
+    dirs[:] = [d for d in dirs if d not in ignore_dirs]
+    for file in files:
+      full_path = os.path.join(root, file)
+      rel_path = os.path.relpath(full_path, base_dir)
+      if any(rel_path.lower().endswith(ext) for ext in ignore_exts):
+        continue
+      if os.path.getsize(full_path) > max_file_size_mb * 1024 * 1024:
+        logger.warning(f"Skipping large file {rel_path}")
+        continue
+      try:
+        with open(full_path, 'r', encoding='utf-8') as f:
+          files_content[rel_path] = f.read()
+      except UnicodeDecodeError:
+        logger.warning(f"Skipping binary or non-text file {rel_path}")
+      except Exception as e:
+        logger.warning(f"Could not read file {rel_path}: {e}")
+
+  return files_content
+
+def build_prompt(user_prompt: str, reference_url: str = None, ecommerce_full: bool = False, scraped_content: str = None):
+  """
+  You are WORTUAL ADVANCE CODING, a professional and friendly assistant for an AI website builder.
+  Your job is to determine the user's intent and return a JSON object with the next action.
+
+   You ALWAYS output JSON and NEVER include explanations.
+
+   You support two modes:
+   (A) Full Website Generation 
+   (B) Single Page / Component Generation 
+   (C) No need to generate always like website template based on the user requirement pages with full functionallties
+   You must detect which mode is appropriate based on the user’s request.
+
+   All generated content must follow:
+   - strict JSON structure
+   - domain-specific UI patterns
+   - clean folder structure
+   - React component architecture
+   - optional backend schemas
+
+   You must generate:
+   1. Project Summary
+   2. Pages
+   3. Components
+   4. API Structure
+   5. Database Schema (if required)
+   6. Folder Structure
+   7. Final Code Bundle
+
+   Special handling:
+   If user requests STT / voice data collection → activate STT Data Collection Mode automatically and generate:
+   CSV upload, audio recorder, dataset submission workflow, library pages, API & DB schema.
+
+   All must be working well don't generating empty or dumpy websit.
+   
+   Never include placeholders or lorem ipsum.
+
+  """
+
+  reference_url_str = reference_url or ""
+  ecommerce_flag = "True" if ecommerce_full else "False"
+
+  scraped_content_block = ""
+  if scraped_content:
+    scraped_content_block = f"""
+  The user provided a reference URL. The following content was scraped and should be used to shape copy, layout, and color scheme (do not copy HTML directly):
+  If user provide any webisite link you must get all the contents from the reference link website so analyze each from page and get the all the website contents
+
+<SCRAPED_CONTENT>
+{scraped_content[:200000]}
+</SCRAPED_CONTENT>
+"""
+
+  ecommerce_instruction = ""
+  if ecommerce_full:
+    ecommerce_instruction = """
+
+
+strict Rules:
+
+  The generated website must strictly follow the rules below:
+
+   1. Authentication Flow (Mandatory for ALL websites)
+   - Every website must include Signup and Login functionality.
+   - When the website loads for the first time, it must open on the Signup page.
+   - After successful signup, redirect the user to the Login page.
+   - After successful login, redirect the user to the Home page.
+
+   2. Branding & Media Requirements
+   - Try to generate the images based on the webiste domain if not possible then generate related random images but never leave as a empty image place holder.
+   - ex: If generated the chocolate factory website home page and all the products have must valid image not a image placeholder.
+
+   3. Website Generation Rules
+   - Generate the complete and fully functional website.
+   - If the project requires 100 React files, then generate all 100 files.
+   - If it requires more than 100 files, generate all of them.
+   - Never limit the number of files.
+   - Include all pages, components, hooks, context providers, utilities, layouts, assets, and configuration files required for a production-ready system.
+   - The UI/UX must always be high-quality, modern, clean, and professionally designed.
+
+   4. Design & Theme Rules
+   - Do NOT reuse the same theme or layout for every project.
+   - Avoid using blue-based colors.
+   - Always use different, professional, solid color themes for each generated website.
+   - Not always generating the website with the very dark blue or dark blue because continiuously generating the website with dark blue color.
+
+   5. Output Expectation
+   - Deliver the full project, including every necessary file, folder, and asset.
+   - Ensure the website is fully runnable without any missing file or placeholder content.
+
+0) STT And TTS:
+- If user asking to develop the dashbord or website to collecting the voice data colection while uploading the csv content mean you want to provide upload field.
+- And after website generation done never show the fake data already prdefined data's.
+
+1) E-COMMERCE MODE ON:
+
+- Build a complete e-commerce React site with:
+- ≥500 mock products (generated dynamically or via JSON).
+- Product listing pages showing 15 / 20 / 25 products per page with proper pagination.
+- Pagination must be accurate — e.g., with 25 items per page,
+- Page 1 = products 125,
+- Page 2 = products 2650, etc.
+- (Numbers should adjust based on selected page size.)
+- Before opening the Home page, show Login and Signup pages with proper validation (Note Signup and login is very Important This is the must be the first page as preview).
+- After successful signup and login, redirect the user to the Home page.
+- User must sign up first, and then log in using the same stored signup data (memory required).
+- Each product must have Purchase and Add to Cart buttons.
+- purchase buttons must redirect to the Cart page, and buttons should be consistent (small) in size.
+- Add to cart button just add the count and store the product detail in cart page.
+- once purchase completed then remove the products fron the cart.
+- Include pages for: Product Details, Cart, Checkout, User Details, Purchase History.
+
+2) Agriculture — MODE ON
+
+Build a complete platform for crop management, farm inputs, and agricultural services.
+Add Login/Signup validation with user memory and role-based access (Farmer, Dealer, Expert).
+Provide dashboards with crop status, weather alerts, soil analytics, and irrigation insights.
+Include detailed listings for seeds, fertilizers, pesticides, machinery, and consultancy services.
+Add product pages with specifications, dosage guides, usage instructions, and pricing.
+Enable add-to-cart, service booking, equipment rental, and expert consultation options.
+Provide farm reports, yield calculators, crop calendars, and disease detection resources.
+Add seasonal offers for seeds, fertilizers, and tools.
+Include an Admin Panel for product management, farmer data, and agricultural resources.
+
+3) Fishing & Aquaculture — MODE ON
+
+Build a platform for fisheries management, aquaculture products, and marine equipment.
+Add secure Login/Signup with user memory for fishermen, hatcheries, and distributors.
+Provide dashboards tracking water quality, feed schedules, stocking density, and harvest cycles.
+Include listings for fish species, feed products, nets, tanks, boats, and accessories.
+Provide detailed product pages with species data, growth rates, handling guidelines, and costs.
+Enable ordering, equipment booking, hatchery reservations, and marine service inquiries.
+Add modules for farm monitoring, disease alerts, pond management, and harvest planning tools.
+Highlight seasonal offers for feed, equipment, and aquaculture tools.
+Provide an Admin Panel to manage species data, users, equipment, and marine resources.
+
+4) Forestry & Logging — MODE ON
+
+Build a platform for forestry operations, timber products, and equipment management.
+Add Login/Signup with role-based access for contractors, inspectors, and suppliers.
+Provide dashboards for forest mapping, timber inventory, cutting schedules, and compliance updates.
+Include listings for timber types, logs, machinery, safety gear, and service tools.
+Add detail pages with wood specifications, moisture levels, grades, and pricing.
+Enable equipment rental, service booking, bulk purchase requests, and permit applications.
+Provide modules for forest tracking, reforestation status, and fire-risk monitoring.
+Add seasonal deals on equipment, protective gear, and logging tools.
+Include an Admin Panel for timber categorization, operations tracking, and workforce management.
+
+
+5) Mining & Quarrying — MODE ON
+
+Build a platform to manage mineral operations, heavy machinery, and workforce logistics.
+Add secure Login/Signup with access levels for engineers, operators, and supervisors.
+Provide dashboards for mine status, production output, hazard alerts, and compliance logs.
+Include listings for minerals, explosives, safety equipment, and machinery rentals.
+Add detailed pages with mineral properties, extraction data, safety data sheets, and pricing.
+Enable booking of equipment, procurement requests, contractor hiring, and material ordering.
+Provide modules for real-time tracking, geological surveys, drilling logs, and shift planning.
+Add special offers for helmets, boots, detectors, and mining essentials.
+Include an Admin Panel for site management, safety documentation, and workforce data.
+
+6) Oil & Gas Operations — MODE ON
+
+Build a platform for upstream/downstream operations, equipment management, and workforce coordination.
+Add secure Login/Signup with access roles for engineers, inspectors, and supervisors.
+Provide dashboards showing well performance, pressure logs, safety alerts, and production metrics.
+Include listings for valves, pipelines, drilling tools, chemicals, and safety gear.
+Add detail pages with specifications, certifications, usage conditions, and procurement options.
+Enable service booking, maintenance scheduling, and equipment ordering workflows.
+Provide modules for inspection reports, incident logs, asset tracking, and field analytics.
+Add seasonal or bulk offers for safety kits and essential equipment.
+Include an Admin Panel to manage inventory, user roles, and operational data.
+
+7) Aerospace & Defense Manufacturing — MODE ON
+
+(Already approved earlier — included for completion)
+Build a secure platform for aerospace components, defense equipment, and manufacturing workflows.
+Implement role-based Login/Signup for engineers, QA teams, vendors, and admins.
+Provide dashboards for production status, compliance alerts, testing logs, and certification tracking.
+Add modules for CAD previews, part specs, material data, and technical documentation.
+Include supply-chain features: procurement, vendor approvals, shipment tracking, and inventory logs.
+Provide defect-tracking, inspection reports, material traceability, and audit records.
+Enable quotation requests for custom components with workflow approvals.
+Add safety bulletins, maintenance tracking, and risk assessments.
+Include an Admin Suite for roles, product databases, and workflow rules.
+
+8) Automotive — MODE ON
+
+Build a platform for vehicles, auto parts, servicing, and dealership operations.
+Add Login/Signup with user memory for buyers, mechanics, and dealers.
+Provide dashboards for vehicle listings, service status, insurance alerts, and maintenance reminders.
+Include listings for new cars, used cars, spare parts, tools, and accessories.
+Add detailed pages with engine data, mileage, pricing, variants, and specifications.
+Enable bookings for test drives, services, repairs, and spare-parts purchases.
+Provide modules for EMI calculators, warranty tracking, insurance renewals, and service history.
+Add seasonal offers on services, accessories, and spare parts.
+Provide an Admin Console for inventory, bookings, dealers, and service management.
+
+9) Chemical Manufacturing — MODE ON
+
+Build a platform for chemical products, industrial materials, and compliance management.
+Add secure Login/Signup with access roles for lab staff, buyers, QA, and distributors.
+Provide dashboards for production batches, QC status, hazard alerts, and inventory tracking.
+Include listings for chemicals, solvents, catalysts, lab tools, and containers.
+Add detailed pages with MSDS sheets, purity levels, grades, usage, and pricing.
+Enable quotation requests, bulk orders, sample requests, and distributor inquiries.
+Provide modules for batch reports, compliance documents, safety protocols, and waste management.
+Highlight seasonal discounts for lab equipment or bulk chemicals.
+Provide an Admin Panel for product data, compliance uploads, and order logs.
+
+10) Construction — MODE ON
+
+Build a platform for construction materials, contractor services, and project management.
+Add Login/Signup with role-based access for clients, engineers, and contractors.
+Provide dashboards for project timelines, resource usage, labor logs, and material tracking.
+Include listings for cement, steel, aggregates, tools, machinery, and design services.
+Add detailed pages with specifications, durability charts, safety data, and cost breakdowns.
+Enable service bookings, contractor hiring, material ordering, and quotation requests.
+Provide modules for blueprint uploads, progress reports, site safety monitoring, and task scheduling.
+Add offers on tools, paints, tiles, and contractor packages.
+Provide an Admin Panel for managing clients, teams, materials, and ongoing projects.
+
+11) Electronics & Technology Hardware — MODE ON
+
+Build a platform for electronic devices, components, hardware tools, and repair services.
+Add Login/Signup with memory for customers, technicians, and wholesalers.
+Provide dashboards for device listings, service status, warranty alerts, and order tracking.
+Include listings for laptops, chips, sensors, routers, PC parts, and accessories.
+Add detailed pages with specs, benchmarks, compatibility data, and pricing.
+Enable ordering, repair booking, installation requests, and bulk purchase inquiries.
+Provide modules for device diagnostics, warranty checks, repair history, and support tickets.
+Highlight deals on gadgets, accessories, and refurbished products.
+Include an Admin Console for inventory, orders, repair logs, and user management.
+
+12) Energy & Power Generation — MODE ON
+
+Build a platform for power plants, renewable energy systems, and grid management operations.
+Add Login/Signup with role-based access for technicians, engineers, operators, and auditors.
+Provide dashboards displaying power output, load distribution, outages, and maintenance alerts.
+Include listings for turbines, solar panels, transformers, batteries, and monitoring tools.
+Add detailed product pages with capacity charts, certifications, tech specs, and lifecycle data.
+Enable service requests, maintenance scheduling, equipment ordering, and inspection bookings.
+Provide modules for safety logs, energy analytics, performance reports, and compliance documents.
+Add deals/sections for solar kits, batteries, and smart meters.
+Include an Admin Panel for grid data, user roles, assets, and field operations.
+
+
+13) Food & Beverage Processing — MODE ON
+
+Build a platform for food production equipment, processed goods, and quality management.
+Add Login/Signup with access roles for manufacturers, lab testers, distributors, and retailers.
+Provide dashboards for batch production, QC results, expiry monitoring, and supply tracking.
+Include listings for raw materials, additives, machines, packaging tools, and consumables.
+Add detailed product pages with nutritional info, safety certificates, batch details, and pricing.
+Enable sample requests, bulk orders, supplier inquiries, and equipment service bookings.
+Provide modules for HACCP tracking, shelf-life prediction, temperature logs, and audit reports.
+Add promotional sections for seasonal products, discounts, and machinery offers.
+Include an Admin Panel to manage products, batches, suppliers, and documentation.
+
+
+14) Industrial Manufacturing & Machinery — MODE ON
+
+Build a platform for factory equipment, spare parts, and industrial workflow management.
+Add Login/Signup with levels for operators, engineers, supervisors, and vendors.
+Provide dashboards for machine health, uptime/downtime, maintenance schedules, and performance.
+Include listings for CNC machines, motors, conveyors, hydraulics, tools, and spare components.
+Add detailed pages with specs, model data, compatibility info, manuals, and pricing.
+Enable purchasing, service booking, AMC scheduling, and spare-part requests.
+Provide modules for work orders, inspection logs, asset management, and breakdown reports.
+Add special offers for tools, spares, and industrial consumables.
+Include an Admin Panel for product catalogs, maintenance logs, and vendor records.
+
+15) Medical Devices & Equipment Manufacturing — MODE ON
+
+Build a platform for medical devices, hospital tools, and compliance-driven manufacturing.
+Add Login/Signup with roles such as manufacturers, hospitals, technicians, and regulators.
+Provide dashboards showing production batches, sterilization logs, QC reports, and certifications.
+Include listings for surgical tools, diagnostic devices, implants, lab instruments, and consumables.
+Add detailed product pages with specs, approvals (FDA/CE), usage guidelines, and pricing.
+Enable order requests, warranty claims, calibration bookings, and AMC scheduling.
+Provide modules for device tracking, maintenance logs, safety alerts, and documentation.
+Add offers on consumables, hospital tools, and diagnostic accessories.
+Include an Admin Panel for batch tracking, compliance uploads, and hospital accounts.
+
+16) Metals & Steel Production — MODE ON
+
+Build a platform for metal products, steel manufacturing tools, and supply-chain operations.
+Add Login/Signup for factories, buyers, contractors, and distributors with data memory.
+Provide dashboards for melt shop status, furnace logs, rolling mill output, and QC metrics.
+Include listings for steel bars, coils, sheets, alloys, castings, and processing equipment.
+Add detailed product pages with grades, hardness, testing reports, dimensions, and pricing.
+Enable bulk quotes, procurement requests, mill scheduling, and delivery tracking.
+Provide modules for heat treatment logs, chemical composition reports, and material certifications.
+Add special-rate sections for bulk orders, scrap sales, and construction-grade materials.
+Include an Admin Panel for inventory, processing data, and customer management.
+
+17) Pharmaceutical & Biotechnology Manufacturing — MODE ON
+
+Build a platform for pharma products, biotech tools, lab equipment, and regulatory workflow.
+Add Login/Signup with roles for researchers, manufacturers, QA teams, and distributors.
+Provide dashboards for batch production, formulation logs, stability testing, and compliance data.
+Include listings for APIs, formulations, lab tools, bioreactors, chemicals, and consumables.
+Add product pages with clinical data, certificates, safety sheets, storage conditions, and pricing.
+Enable sample requests, bulk orders, vendor inquiries, and trial batch bookings.
+Provide modules for GMP tracking, audit logs, documentation, and regulatory workflows.
+Add offers on lab tools, consumables, and research kits.
+Include an Admin Panel for products, documents, users, and compliance reports.
+
+
+18) Shipbuilding — MODE ON
+
+Build a platform for ship components, marine engineering tools, and dockyard workflows.
+Add secure Login/Signup for engineers, contractors, suppliers, and inspectors.
+Provide dashboards showing build progress, maintenance logs, safety alerts, and material usage.
+Include listings for hull components, engines, marine electronics, safety gear, and tools.
+Add detailed pages with specifications, certifications, blueprints, and pricing.
+Enable equipment orders, contractor hiring, inspection booking, and dock scheduling.
+Provide modules for crew management, vessel documentation, compliance checks, and repair history.
+Add special offers for tools, marine gear, and components.
+Include an Admin Panel for fleet records, project tracking, and workforce details.
+
+19) Textiles, Apparel & Leather — MODE ON
+
+Build a platform for textile products, apparel manufacturing, and fashion supply chain operations.
+Add Login/Signup with roles for designers, manufacturers, retailers, and vendors.
+Provide dashboards for production status, inventory levels, order tracking, and quality checks.
+Include listings for fabrics, garments, accessories, machinery, dyes, and leather goods.
+Add detailed pages with fabric GSM, color options, material type, design variants, and pricing.
+Enable sample ordering, bulk purchase, tailoring requests, and custom design inquiries.
+Provide modules for style catalogs, stitching logs, size charts, and trend analytics.
+Add seasonal offers for fabrics, fashion items, and production tools.
+Include an Admin Panel for managing catalogs, orders, and manufacturing data.
+
+
+20) Water Supply & Waste Management — MODE ON
+
+Build a platform for water treatment systems, waste management tools, and municipal services.
+Add Login/Signup for engineers, households, contractors, and inspection teams.
+Provide dashboards showing water quality, waste collection schedules, distribution status, and alerts.
+Include listings for filtration systems, pipes, pumps, waste bins, recycling tools, and chemicals.
+Add detailed pages with purification data, compliance certificates, usage instructions, and pricing.
+Enable service booking, maintenance requests, equipment orders, and municipal inquiries.
+Provide modules for consumption tracking, waste logs, recycling insights, and environmental reports.
+Add offers for household filters, bins, pumps, and eco-products.
+Include an Admin Panel for data tracking, service assignments, and community management.
+
+21) Accounting & Legal Services — MODE ON
+
+Build a platform for accounting services, tax filing, legal documentation, and client management.
+Add Login/Signup with roles for clients, accountants, auditors, and legal professionals.
+Provide dashboards with financial summaries, pending cases, deadlines, and compliance alerts.
+Include listings for legal services, tax packages, documentation templates, and consulting plans.
+Add detailed pages with service descriptions, pricing, requirements, and necessary documents.
+Enable appointment booking, document upload, e-signing, payment, and case tracking.
+Provide modules for invoicing, tax calculators, contract management, and audit logs.
+Add offers for tax-season packages and subscription services.
+Include an Admin Panel for clients, billing, documents, and service assignments.
+
+22) Advertising & Marketing — MODE ON
+
+Build a platform for digital marketing services, campaign management, and creative assets.
+Add Login/Signup with roles for clients, marketers, designers, and analysts.
+Provide dashboards showing campaign performance, leads, conversions, and ROI metrics.
+Include listings for marketing plans, ad packages, branding services, SEO tools, and creatives.
+Add service detail pages with pricing, deliverables, timelines, and strategy outlines.
+Enable bookings for campaigns, content creation, social media packages, and ad management.
+Provide modules for analytics reports, content calendars, audience insights, and A/B testing.
+Add offers for seasonal campaigns, festival packages, and ad bundles.
+Include an Admin Panel for campaign approvals, client accounts, and performance tracking.
+
+
+23) Banking & Financial Services — MODE ON
+
+Build a secure platform for financial products, digital banking tools, and customer accounts.
+Add Login/Signup with two-step verification and role-based access (Customer, Agent, Admin).
+Provide dashboards showing account balances, transactions, investments, and loan status.
+Include listings for credit cards, loans, savings plans, investment products, and insurance.
+Add detailed product pages with eligibility, interest rates, benefits, and documentation needs.
+Enable loan applications, card requests, fund transfers, bill payments, and KYC submission.
+Provide modules for spending analytics, EMI calculators, credit score tracking, and statements.
+Add special offers on loans, cards, investment plans, and seasonal banking schemes.
+Include an Admin Backoffice for user verification, account management, and compliance logs.
+
+
+24) Commercial & Professional Services — MODE ON
+
+Build a platform offering business services, consulting packages, and professional solutions.
+Add Login/Signup for clients, consultants, teams, and service managers.
+Provide dashboards showing booked services, progress updates, deliverables, and invoices.
+Include listings for consulting, HR services, audit support, design work, training, and IT solutions.
+Add detail pages with service scopes, timelines, requirements, and pricing.
+Enable appointment booking, proposal requests, project submissions, and document uploads.
+Provide modules for ticketing, task management, time tracking, and reporting.
+Add offers for bundled services, startup packages, and long-term subscriptions.
+Include an Admin Panel for service management, billing, clients, and workload assignments.
+
+
+25) Education & Training — MODE ON
+
+Build a platform for online courses, coaching, training programs, and skill development.
+Add Login/Signup for students, instructors, admins, and evaluators.
+Provide dashboards showing enrolled courses, progress, certificates, and announcements.
+Include listings for courses, workshops, study materials, live classes, and practice tests.
+Add detail pages with syllabus, duration, instructors, requirements, and pricing.
+Enable enrollment, assessments, online exams, doubt sessions, and certificate downloads.
+Provide modules for LMS content, assignments, attendance, performance analytics, and feedback.
+Add offers for premium courses, bundled learning paths, and seasonal discounts.
+Include an Admin Panel for course creation, instructor onboarding, and academic data.
+
+
+26) Entertainment & Media — MODE ON
+
+Build a platform for streaming content, media services, and creative portfolios.
+Add Login/Signup with roles for viewers, creators, production teams, and admins.
+Provide dashboards showing watch history, trending content, subscriptions, and creator analytics.
+Include listings for movies, shows, music, events, artists, and media services.
+Add detail pages with ratings, cast info, reviews, trailers, and pricing.
+Enable streaming, content upload, ticket booking, playlist creation, and subscription purchases.
+Provide modules for live events, creator dashboards, monetization analytics, and media distribution.
+Use entertainment-related visuals or placeholders for missing assets.
+Add offers for seasonal events, premium packs, and creator promotions.
+Include an Admin Panel for content moderation, publishing, subscriptions, and media rights.
+
+27) Government & Public Administration — MODE ON
+
+Build a platform for citizen services, government schemes, and administrative workflows.
+Add Login/Signup with verification for citizens, officials, and department roles.
+Provide dashboards showing applications, approvals, service status, and notifications.
+Include listings for certificates, schemes, utilities, public documents, and service categories.
+Add detailed pages with eligibility, documents required, timelines, and instructions.
+Enable service applications, grievance submissions, payment of utilities, and tracking.
+Provide modules for workflow approvals, document verification, and digital signatures.
+Add informational banners for public alerts, schemes, and announcements.
+Include an Admin Panel for department management, workflows, and citizen data.
+
+28) Healthcare — MODE ON
+
+Build a platform for hospitals, clinics, medical services, and patient health management.
+Add Login/Signup with roles for patients, doctors, staff, and administrators.
+Provide dashboards showing appointments, medical records, prescriptions, and lab results.
+Include listings for doctors, departments, tests, medical packages, and wellness plans.
+Add detail pages with doctor profiles, treatment options, schedules, and pricing.
+Enable appointment booking, teleconsultation, medicine ordering, and health record uploads.
+Provide modules for patient records, treatment history, billing, and diagnostics.
+Add special offers on health checkups, packages, and preventive care.
+Include an Admin Panel for hospital operations, doctor schedules, and patient management.
+
+29) Hospitality & Tourism — MODE ON
+
+Build a platform for hotels, travel bookings, tourism packages, and hospitality services.
+Add Login/Signup with roles for travelers, hotel managers, agents, and admins.
+Provide dashboards showing bookings, itineraries, payments, reviews, and recommendations.
+Include listings for hotels, resorts, tour packages, destinations, rentals, and activities.
+Add detail pages with photos, amenities, pricing, availability, and policies.
+Enable hotel booking, trip planning, payment, cancellation, and review submission.
+Provide modules for itinerary builders, travel guides, maps, and user preferences.
+Add offers for seasonal trips, holiday packages, and last-minute deals.
+Include an Admin Panel for hotel listings, bookings, customers, and travel partners.
+
+30) Information Technology (IT) Services — MODE ON
+
+Build a platform for software services, IT consulting, and digital transformation solutions.
+Add Login/Signup for clients, developers, project managers, and admins.
+Provide dashboards showing project progress, tickets, deliverables, and timelines.
+Include listings for IT services, cloud solutions, development packages, and support plans.
+Add detail pages with scope, pricing, tech stack, requirements, and milestones.
+Enable project onboarding, service purchase, ticket submission, and document uploads.
+Provide modules for code repositories, workflow automation, monitoring, and analytics.
+Add offers on cloud packages, AMC plans, and development bundles.
+Include an Admin Panel for client projects, teams, billing, and SLA tracking.
+
+31) Logistics & Transportation — MODE ON
+
+Build a platform for logistics services, fleet management, and shipment operations.
+Add Login/Signup with roles for clients, drivers, dispatchers, and admins.
+Provide dashboards showing shipment tracking, delivery status, fleet health, and route analytics.
+Include listings for cargo services, transport vehicles, warehousing options, and delivery plans.
+Add detailed pages with pricing, delivery timelines, cargo rules, and capacity data.
+Enable shipment booking, pickup scheduling, tracking, billing, and documentation uploads.
+Provide modules for fleet monitoring, route optimization, driver logs, and fuel analytics.
+Add promotional offers for bulk shipments, express delivery, and long-term contracts.
+Include an Admin Panel for fleet data, assignments, service logs, and route management.
+
+32) Retail & Wholesale Trade MODE ON:
+
+Build a complete platform for retail and wholesale product listings with category-based navigation.
+Add secure Login/Signup with validation and personalized home dashboard.
+Include product catalogs, bulk order options, pricing tiers, and inventory indicators.
+Provide pages for product details, reviews, offers, and similar item suggestions.
+Add cart, wishlist, quick order, bulk-order quotation, and checkout features.
+Include order tracking, invoices, purchase history, and return management.
+Add promotional banners, discount sections, and seasonal sale highlights.
+Integrate payment gateways and multi-vendor support if needed.
+Provide an Admin Panel to manage products, orders, vendors, users, and promotions.
+
+33) Telecommunications MODE ON:
+
+Build a full website for telecom services such as mobile plans, broadband, and enterprise connectivity.
+Add Login/Signup with OTP/email verification and user profile management.
+Include service catalogs: prepaid, postpaid, broadband, IoT SIMs, enterprise solutions.
+Provide tools to compare plans, activate SIMs, and check coverage maps.
+Add pages for recharge, bill payment, service upgrades, and add-ons.
+Include complaint management, service status, and technician booking.
+Use icons/visuals for networks, devices, routers; placeholders if missing.
+Add offers: data packs, festival plans, bundle discounts.
+Provide dashboards showing usage, remaining data, bills, and active plans.
+Add Admin Panel to manage plans, services, users, recharges, and tickets.
+
+34) Advanced Scientific Research & Development (R&D) MODE ON:
+
+Create a website for research institutions, labs, or innovation centers.
+Add secure Login/Signup with researcher profiles and role-based access.
+Include sections for research projects, publications, teams, and lab facilities.
+Add tools for experiment tracking, data logs, research timelines, and documentation.
+Provide knowledge-base pages with articles, methods, and reference materials.
+Add dashboards to view project progress, assigned tasks, and funding usage.
+Include sections for collaborations, partnerships, and ongoing experiments.
+Add a portal for submitting proposals, reports, and lab booking requests.
+Provide an Admin Panel to manage researchers, projects, assets, and publications.
+
+35) Artificial Intelligence (AI) MODE ON:
+
+Build a website/platform focused on AI tools, models, solutions, or automation services.
+Add Login/Signup with workspace creation and personalized dashboards.
+Include AI product/tool listings: chatbots, automation flows, analytics modules, etc.
+Provide pages for model documentation, API usage, demo playgrounds, and tutorials.
+Add features like dataset upload, model training logs, inference history, and results.
+Include subscription plans, usage metrics, and billing dashboards.
+Use visuals like AI icons, neural networks, robots; placeholders if unavailable.
+Add knowledge base, FAQs, and integration guides.
+Provide notifications for model updates, errors, or completed tasks.
+Add Admin Panel to manage users, models, datasets, subscriptions, and logs.
+
+36) High-Level Decision Making MODE ON:
+
+Build a platform for business intelligence, analytics, and strategic decision support.
+Add Login/Signup with role-based dashboards for executives, analysts, and teams.
+Include modules for KPIs, performance metrics, forecasts, and business reports.
+Provide tools for scenario simulation, risk assessments, and financial planning.
+Add data visualization pages with charts, insights, and multi-department views.
+Provide collaboration tools: notes, shared boards, decision logs.
+Use relevant visuals like dashboards, graphs, analytics icons; placeholders if missing.
+Add secure data imports, export features, and integration with ERP/CRM systems.
+Include notification center for alerts, updates, and performance deviations.
+Provide Admin Panel for managing teams, analytics modules, permissions, and data sources.
+
+37) Information Services MODE ON:
+
+Create a website for data services, information portals, or digital knowledge platforms.
+Add Login/Signup with customizable content feeds and user preferences.
+Include categories for articles, reports, data insights, guides, and documentation.
+Provide search, filtering, bookmarking, and content recommendation features.
+Add tools for downloading datasets, subscribing to topics, or requesting reports.
+Include dashboards for recently viewed items, saved lists, and updates.
+Add sections for trending data, expert insights, and info alerts.
+Provide mobile-friendly layouts and fast content loading.
+Add Admin Panel to manage content, categories, subscriptions, and users.
+
+38) Aquarium & Marine Life MODE ON:
+
+Build a complete aquarium-focused website/platform featuring marine species, aquarium setups, equipment, and aquatic services.
+Provide secure Login & Signup pages with validation, user profile memory, and post-login redirection to the main dashboard.
+Include species listings with detailed info such as habitat, tank size, temperament, compatibility, and feeding guides.
+Add sections for aquarium equipment: filters, lighting, heaters, food, pumps, substrates, tanks, and accessories.
+Provide a tank-builder tool where users can simulate tank size, fish compatibility, and setup suggestions.
+Include product detail pages, care guides, cart, checkout, booking appointments, and maintenance service pages.
+Add action buttons like “Add to Tank Plan,” “Add to Cart,” “Book Maintenance,” and “Ask Expert.”
+Create educational pages: water chemistry, cycling process, disease treatments, freshwater vs. marine guides.
+Add offer sections for seasonal fish, starter kits, combo packs, and maintenance packages.
+
+simulated payment flow.
+- Use images related to the product name; if unavailable, show a random image.
+- The Home page must include discount/offer sections.
+- Never generate the websit name as Atlas Ai and Wortual.
+- provide the valid website logo
+- If user try to edit the profile then we want to provide edit access and after save that data as user detail.
+"""
+
+  return f"""
+SYSTEM INSTRUCTION:
+CRITICAL: You must return only ONE valid JSON object.
+- No markdown, no triple backticks, no explanations.
+- Your reply must start with '{' and end with '}'.
+- Do NOT include any comments or extra text outside JSON.
+If you include invalid JSON, the process will fail.
+Keys = file paths (e.g. "index.html", "src/App.jsx"); values = full file contents.
+Invalid or partial JSON will cause build failure.
+
+
+TECH STACK RULES
+- Framework: React (functional components, hooks) with advance coding.
+- Styling: TailwindCSS (configured via vite + postcss).
+- Routing: react-router-dom (BrowserRouter, Routes, Route).
+- Icons: lucide-react.
+- vite.config.js must include: base: "".
+- package.json must include: scripts: {{"dev":"vite","build":"vite build","preview":"vite preview"}} and dependencies for vite, react, tailwindcss, autoprefixer, postcss.
+
+PROJECT GOAL
+Industry / Theme: "{user_prompt}"
+Generate a high-quality, responsive, multi-page website for this domain using modern layout and color palette.
+The design should match the quality of leading companies in this industry.
+
+STRUCTURE REQUIREMENTS
+- Required pages/components:
+ *signup-login(/)
+ * Home (/)
+ * About (/about)
+ * Services or Products (/services)
+ * Contact (/contact)
+ * Based on the website requirements create more pages
+ * 6-10 industry-specific pages
+- All links in navbar/footer must navigate to existing content pages.
+- Include hero, features/services, testimonials, and call-to-action.
+- Footer must include About, Services/Products, Contact, Privacy Policy, Terms of Service — all functional.
+- Always find the correct location where the icon present and provide in the front end.
+- Inside the footer you want to provide the social media contact with icon to visit the our social media pages 
+- Like Twitter,instagram,Face Book, linked In, etc...
+- Those social medial link redirct to the those website home page
+
+CODING & BUILD SAFETY RULES
+- Each JSX component must have valid syntax, imports, and exports.
+- Always import React and hooks explicitly.
+- No undefined variables or missing imports.
+- Ensure npm run build succeeds with no errors(handle carefully).
+
+UI/UX Development Instructions:
+    Role: You are a senior UI/UX designer and frontend architect with expertise in responsive web design, modern UI frameworks (React, Next.js, Tailwind CSS, Framer Motion), and user-centered design systems.
+
+    Output Requirements:
+    Produce pixel-perfect UI/UX layout descriptions with component hierarchy, color palettes, typography, and interaction states.
+    Provide Figma-style section breakdowns (e.g., Hero Section, Dashboard, Template Gallery, Editor Interface).
+    Use modern design principles — minimalism, depth (soft shadows, glassmorphism, neumorphism where appropriate), and responsive grid layouts.
+    Suggest animations and transitions using Framer Motion or CSS (e.g., smooth fade-ins, slide transitions, micro-interactions).
+    Include user experience flow for key actions (e.g., creating a website, customizing templates, publishing).
+    Recommend accessibility improvements (WCAG 2.1).
+    Generate UI component names and layout hierarchy in JSON or structured format for developers.
+
+    Context:
+    Platform name: Worktual advance coding
+    Purpose: AI-powered website builder that generates complete websites from user prompts.
+    Primary target users: Entrepreneurs, developers, and content creators.
+    Brand tone: Futuristic, intelligent, elegant, with a balance of productivity and creativity.
+    Primary colors: Deep blue #0A192F, electric cyan #64FFDA, accent magenta #E100FF, white backgrounds with subtle gradients.
+    Deliverables (in text or Figma-style description):
+    UI Layout Plan (with sections and grid structure)
+    Component Hierarchy Tree
+    Color Palette & Typography Guide
+    Animations & Motion Guidelines
+    Responsive Behavior Notes
+    Developer Handoff Notes (React/Tailwind structure preferred)
+    OUTPUT & TECHNICAL REQUIREMENTS
+    - The JSON output must include the files needed to run the project after:
+    npm install && npm run dev
+    - The generated project should include (as applicable):
+    - index.html with responsive meta tags and favicon reference
+    - package.json with scripts: dev, build, preview
+    - Vite, PostCSS, and Tailwind configuration if Tailwind is used
+    - React entry (src/main.jsx) and main App (src/App.jsx) or equivalent
+    - All referenced assets and valid import paths
+    - For e-commerce ONLY when explicitly requested:
+    - If ecommerce_full=True, generate a product data source (500+ mock items or a generator), listing pages with pagination, product pages, cart, checkout, and payment simulation.
+    - If ecommerce_full=False, do NOT produce the large catalog; produce only product/landing UI as requested.
+
+    DESIGN VARIATION RULE
+    - Each generation should vary layout, component arrangement, and color palette (choose from slate, emerald, indigo, rose, amber, etc.).
+    - Keep the design original and avoid copying HTML/CSS verbatim from the reference URL.
+    
+{ecommerce_instruction}
+
+REFERENCE CONTEXT
+URL: {reference_url_str}
+Ecommerce Mode: {ecommerce_flag}
+{scraped_content_block}
+
+FINAL OUTPUT FORMAT
+Return ONLY one JSON object:
+{{
+ "index.html": "...",
+ "vite.config.js": "...",
+ "src/App.jsx": "...",
+ ...
+}}
+No commentary or markdown allowed.
+"""
+
+
+def edit_prompt(user_prompt: str, existing_files_content: Dict[str, str]):
+ # ... (Kept the original edit_prompt logic)
+ """Generates the prompt for the AI to perform a targeted edit on existing code."""
+ 
+ existing_code_str = "\n\n--- EXISTING PROJECT FILES ---\n\n"
+ for path, content in existing_files_content.items():
+ 
+  display_content = content
+  existing_code_str += f"### FILE PATH: {path}\n```\n{display_content}\n```\n"
+
+ return f"""
+You are an expert full-stack web developer and an **editor**.
+Your task is to implement the requested change into the **existing codebase** provided below.
+**You must ONLY modify the provided files; DO NOT generate a new website from scratch or perform web searches.**
+The existing website uses React and Tailwind CSS.
+
+**USER CHANGE REQUEST:** "{user_prompt}"
+
+**INSTRUCTIONS:**
+### Important Instruction:
+
+- If a customer requests a name change, always ask for additional clarification, such as the website name or relevant context, before proceeding.
+
+- Do not generate images or visual representations of the website name. Always provide the output only as text.
+
+1. Analyze the existing files provided in the 'EXISTING PROJECT FILES' section. These are the *complete* files.
+2. Apply the user's change request precisely (e.g., add a feature, update a color, modify a component).
+3. You MUST return ONLY a JSON object where:
+ - Keys are the file paths of the files that need to be **modified** or **added**.
+ - Values are the **complete, updated content** of those files.
+ - **Do NOT** include files that were not changed. Only provide the new, complete version of the changed files.
+4. Maintain the existing React + Tailwind structure and all functionality.
+
+{existing_code_str}
+
+**RETURN ONLY THE JSON MAPPING OF MODIFIED FILES.**
+"""
+def write_files(file_map: dict, base_dir: str):
+  """
+  Safely writes a dictionary of files (path → content) to disk.
+  Handles text and binary (base64) formats automatically.
+  """
+  for rel_path, content in file_map.items():
+    path = os.path.join(base_dir, rel_path.lstrip("/\\"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    binary_exts = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico", ".svg"]
+    ext = os.path.splitext(path)[1].lower()
+
+    # Binary file detection
+    if isinstance(content, (bytes, bytearray)):
+      mode = "wb"
+    elif ext in binary_exts:
+      import base64
+      try:
+        with open(path, "wb") as f:
+          if isinstance(content, str):
+            if "base64," in content:
+              _, content = content.split("base64,", 1)
+            f.write(base64.b64decode(content))
+          else:
+            f.write(content)
+        continue
+      except Exception:
+        mode = "w"
+    else:
+      mode = "w"
+
+    # Write text/binary content safely
+    with open(path, mode, encoding=None if "b" in mode else "utf-8") as f:
+      if "b" in mode:
+        if isinstance(content, str):
+          f.write(content.encode("utf-8", errors="ignore"))
+        else:
+          f.write(content)
+      else:
+        f.write(str(content))
+
+# --- MODIFIED: Main Generation Task ---
+async def generate_website_with_progress(
+ user_prompt: str, 
+ reference_paths: List[str], 
+ reference_url: str, 
+ status_queue: asyncio.Queue,
+ project_id: str = None, 
+ is_edit: bool = False,
+ existing_files_content: Dict[str, str] = None
+):
+ global current_project_info
+ 
+ task_type = "Editing" if is_edit else "Generating New"
+ await status_queue.put({"status": "log", "message": f"{task_type} website process initialized."})
+
+ try:
+  if not API_KEY:
+   await status_queue.put({"status": "error", "message": "API client not initialized. Check GEMINI_API_KEY."})
+   return
+   
+  async_client = genai.Client(api_key=API_KEY) 
+  
+  if not project_id:
+   project_id = str(uuid.uuid4())
+   logger.info(f"New project ID created: {project_id}")
+  else:
+   logger.info(f"Editing existing project ID: {project_id}")
+
+  project_dir = os.path.join(PROJECTS_BASE_DIR, project_id)
+  project_dist_dir = os.path.join(project_dir, "dist")
+  project_zip_path = os.path.join(PROJECTS_ZIPS_DIR, f"{project_id}.zip")
+
+  os.makedirs(project_dir, exist_ok=True)
+
+  summary_message = f"**{task_type} Website (ID: {project_id}):** Planning a high-quality, modern website based on: **'{user_prompt}'**."
+  if reference_paths:
+   summary_message += f" Utilizing {len(reference_paths)} reference image(s)."
+  
+  scraped_content = None
+  if reference_url:
+   # Removed scrape_website_content check as it's assumed to be integrated externally or mocked
+   summary_message += f" Scraping content from URL: {reference_url}."
+   await status_queue.put({"status": "log", "message": f"Scraping content from {reference_url}..."})
+   # Assume scraping happens here and result is scraped_content
+   await status_queue.put({"status": "log", "message": "Content scrape simulated successfully."})
+
+  await status_queue.put({"status": "summary", "message": summary_message})
+  await status_queue.put({"status": "log", "message": "AI Model analyzing the prompt and generating the project structure..."})
+
+  is_ecommerce_full = "e-commerce" in user_prompt.lower() or "store" in user_prompt.lower() or "shop" in user_prompt.lower()
+  
+  if is_edit and existing_files_content:
+   ai_prompt = edit_prompt(user_prompt, existing_files_content)
+  else:
+   ai_prompt = build_prompt(
+    user_prompt, 
+    reference_url=reference_url, 
+    ecommerce_full=is_ecommerce_full,
+    scraped_content=scraped_content
+   )  
+  chat = async_client.aio.chats.create(model=CODE_GEN_MODEL)
+  
+  content_parts = [ai_prompt]
+  
+  for path in reference_paths:
+   try:
+    content_parts.append(genai.types.Part.from_file(path))
+    logger.info(f"Attached image {os.path.basename(path)} to the prompt for analysis.")
+   except Exception as e:
+    logger.warning(f"Could not load image file {path} for multimodal analysis: {e}")
+
+  
+  full_response_text = ""
+  response_stream = await chat.send_message_stream(content_parts)
+
+  async for chunk in response_stream:
+   if chunk.text is not None:
+    full_response_text += chunk.text
+   
+  files = safe_json_parse(full_response_text)
+  
+  if not files:
+   await status_queue.put({"status": "error", "message": "AI did not return a valid file map JSON. Generation aborted. Ensure the prompt is clear."})
+   return
+
+  await status_queue.put({"status": "log", "message": f"Code received for {len(files)} files. Writing/Updating to disk..."})
+
+  file_list = list(files.keys())
+  for i, file_path in enumerate(file_list):
+   await status_queue.put({
+    "status": "generating", 
+    "file": file_path, 
+    "progress": int((i + 1) / len(file_list) * 50),
+    "count_current": i + 1,
+    "count_total": len(file_list)
+   })
+   write_files({file_path: files[file_path]}, project_dir) 
+   
+  await status_queue.put({"status": "log", "message": "Files written successfully. Starting NPM build process (for React/Vite)..."})
+  
+  build_success = run_npm_build(project_dir)
+  
+  await status_queue.put({"status": "generating", "file": "Build Process (npm run build)", "progress": 75})
+  
+  if not build_success:
+   await status_queue.put({"status": "error", "message": "NPM build failed. The generated code or config is likely invalid. Check logs."})
+   return 
+
+  await status_queue.put({"status": "log", "message": "Compressing project files into ZIP..."})
+  zip_directory(project_dir, project_zip_path)
+  
+  await status_queue.put({"status": "generating", "file": "Finalizing Assets & Zipping", "progress": 95})
+
+  # ... (Project name extraction remains the same)
+  website_name_match = re.search(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*(?:E-Commerce|Website|Site|App)', user_prompt, re.IGNORECASE)
+  if website_name_match:
+   project_name = website_name_match.group(1).strip()
+  elif "for a" in user_prompt.lower() and len(user_prompt.split()) > 5:
+   parts = user_prompt.lower().split("for a", 1)
+   if len(parts) > 1:
+    project_name = parts[1].strip().split(',')[0].split('.')[0].capitalize()
+   else:
+    project_name = user_prompt.split(' ')[0:3]
+    project_name = ' '.join(project_name).strip() + ' Site'
+  else:
+   project_name = user_prompt.split(' ')[0:3]
+   project_name = ' '.join(project_name).strip() + ' Site'
+   
+  project_name = re.sub(r'^(build|create|develop|a|an|the)\s+', '', project_name, flags=re.IGNORECASE).strip()
+  
+  current_project_info = {
+   "id": project_id, 
+   "name": project_name,
+   "description": user_prompt,
+   "is_ecommerce": is_ecommerce_full
+  }
+  logger.info(f"Project info saved: {current_project_info['name']} (ID: {project_id})")
+
+  await status_queue.put({
+   "status": "complete", 
+   "preview_url": f"/preview/{project_id}/index.html", 
+   "zip_url": f"{APP_HOST}/download/{project_id}"
+  })
+
+ except Exception as e:
+  logger.exception("Generation/Edit failed")
+  # Clean up reference files after generation attempt
+  for path in reference_paths:
+   if os.path.exists(path):
+     os.remove(path)
+  await status_queue.put({"status": "error", "message": f"Fatal Error: {str(e)}. Please check backend logs for details."})
+
+
+# --- ENDPOINTS ---
+
+@app.post("/generate")
+async def start_generation(
+ prompt: str = Form(...),
+ is_edit: bool = Form(False),
+ project_id: str = Form(None), 
+ screenshot_files: List[UploadFile] = File(None, alias="screenshot_files") 
+):
+ global chat_context
+ 
+ try:
+  if not prompt.strip():
+   raise HTTPException(status_code= 400, detail="Missing text prompt")
+
+  prompt_text = prompt.strip()
+  reference_url = None
+  
+  url_match = re.search(r'(https?://[^\s/$.?#].[^\s]*)', prompt_text)
+  if url_match:
+   reference_url = url_match.group(1)
+   prompt_text = prompt_text.replace(reference_url, '').strip()
+   logger.info(f"Extracted URL for scraping: {reference_url}")
+   
+  
+  reference_paths = []
+  
+  # NEW/MODIFIED: Determine which project ID to use
+  current_id = project_id if is_edit and project_id else str(uuid.uuid4())
+    
+  PROJECT_DIR = os.path.join(PROJECTS_BASE_DIR, current_id)
+  PROJECT_UPLOAD_DIR = os.path.join(PROJECT_DIR, "uploads")
+  
+  # NEW/MODIFIED: Save temp uploads directly inside the project dir
+  if screenshot_files:
+   os.makedirs(PROJECT_UPLOAD_DIR, exist_ok=True)
+   for file in screenshot_files:
+    file_path = os.path.join(PROJECT_UPLOAD_DIR, file.filename)
+    with open(file_path, "wb") as buffer:
+     file.file.seek(0)
+     shutil.copyfileobj(file.file, buffer)
+    reference_paths.append(file_path)
+   
+   logger.info(f"Saved {len(reference_paths)} uploaded screenshot(s) to {PROJECT_UPLOAD_DIR}.")
+   
+  existing_files_content = {}
+  if is_edit:
+    if not os.path.exists(PROJECT_DIR):
+      return {"success": False, "message": f"Cannot edit: Project {current_id} not found."}
+    existing_files_content = read_small_file_set(PROJECT_DIR, prompt_text)
+    
+    if not existing_files_content:
+      logger.warning(f"Edit requested for {current_id}, but project is empty/unreadable. Proceeding as fresh generation with same ID.")
+    is_edit = False 
+   
+  status_queue = asyncio.Queue()
+  gen_id = str(datetime.utcnow().timestamp())
+  
+  generation_state[gen_id] = {
+   "queue": status_queue,
+   "stop": asyncio.Event(),
+   "finished": False
+  }
+  
+  chat_context.clear()
+  
+  # --- FIX START: Pass arguments by keyword to avoid TypeError ---
+  asyncio.create_task(
+   generate_website_with_progress(
+    user_prompt=prompt_text, 
+    reference_paths=reference_paths, 
+    reference_url=reference_url, 
+    status_queue=status_queue, 
+    is_edit=is_edit, 
+    existing_files_content=existing_files_content,
+    project_id=current_id # Pass the determined project ID
+   )
+  )
+  # --- FIX END ---
+
+  return {"success": True, "message": "Website process started!", "task_id": gen_id, "is_edit": is_edit}
+
+ except Exception as e:
+  logger.exception("Generation failed at startup")
+  raise HTTPException(status_code=500, detail=f"Generation Startup Error: {str(e)}")
+
+
+@app.get("/generate_stream/{task_id}")
+async def generate_stream_endpoint(task_id: str):
+ # ... (Kept the original generate_stream_endpoint logic)
+ task = generation_state.get(task_id)
+ if not task:
+  raise HTTPException(status_code=404, detail="Task not found or timed out.")
+
+ async def stream_status():
+  try:
+   while not task["finished"] or not task["queue"].empty():
+    try:
+     update = await asyncio.wait_for(task["queue"].get(), timeout=30)
+     
+     if update.get("status") in ["log", "summary", "generating", "complete", "error"]:
+      logger.info(f"Streaming update: {update}")
+     
+     yield f"data: {json.dumps(update)}\n\n"
+     
+     if update.get("status") in ["complete", "error"]:
+      task["finished"] = True
+      break
+
+    except asyncio.TimeoutError:
+     if task["finished"]:
+      break
+     yield ":keep-alive\n\n"
+     
+   logger.info(f"Streaming for task {task_id} finished.")
+   
+  except Exception as e:
+   logger.error(f"Error during streaming for task {task_id}: {e}")
+
+ return StreamingResponse(stream_status(), media_type="text/event-stream")
+
+
+@app.get("/get_project_files/{project_id}") 
+async def get_project_files_endpoint(project_id: str):
+ PROJECT_DIR = os.path.join(PROJECTS_BASE_DIR, project_id) 
+
+ if not os.path.exists(PROJECT_DIR):
+  raise HTTPException(status_code=404, detail=f"Project ID {project_id} not found.")
+  
+ try:
+  files_content = read_current_project_files(PROJECT_DIR) 
+  
+  editable_files = {
+   k: v for k, v in files_content.items() 
+   if any(k.endswith(ext) for ext in [
+    '.jsx', '.js', '.html', '.css', '.json', '.ts', '.tsx', '.config.js',
+    '.md', '.txt'
+   ])
+  }
+  
+  return JSONResponse({"success": True, "files": editable_files, "project_id": project_id})
+  
+ except Exception as e:
+  logger.exception("Failed to read project files")
+  raise HTTPException(status_code=500, detail=f"Error reading project files: {str(e)}")
+
+
+@app.post("/update_code_manual/{project_id}") 
+async def manual_code_update(project_id: str, request: Request):
+ PROJECT_DIR = os.path.join(PROJECTS_BASE_DIR, project_id) 
+ 
+ try:
+  data = await request.json()
+  files_to_update = data.get("files", {})
+  
+  if not files_to_update:
+   raise HTTPException(status_code=400, detail="No files provided for update.")
+   
+  if not os.path.exists(PROJECT_DIR):
+   raise HTTPException(status_code=404, detail=f"Cannot update: Project ID {project_id} not found.")
+
+  update_summary = []
+  
+  for file_path, new_content in files_to_update.items():
+   write_files({file_path: new_content}, PROJECT_DIR) 
+   update_summary.append(file_path)
+
+  logger.info(f"Manually updated files for {project_id}: {update_summary}")
+
+  if run_npm_build(PROJECT_DIR): 
+   return JSONResponse({
+    "success": True, 
+    "message": f"Successfully updated {len(update_summary)} files. Build complete. Preview refreshed.",
+    "preview_url": f"/preview/{project_id}/index.html" 
+   })
+  else:
+   raise HTTPException(status_code=500, detail="Code updated, but NPM build failed. Check the generated code for errors.")
+
+ except HTTPException:
+  raise
+ except Exception as e:
+  logger.exception("Manual code update failed")
+  raise HTTPException(status_code=500, detail=f"Manual Update Error: {str(e)}")
+
+
+@app.get("/download/{project_id}") 
+async def download_zip(project_id: str):
+ PROJECT_ZIP_PATH = os.path.join(PROJECTS_ZIPS_DIR, f"{project_id}.zip") 
+
+ if not os.path.exists(PROJECT_ZIP_PATH):
+  raise HTTPException(status_code=404, detail=f"Website package for ID {project_id} not found. Please generate a website first.")
+ 
+ return FileResponse(
+  PROJECT_ZIP_PATH,
+  media_type="application/zip",
+  filename=f"ai_generated_website_{project_id}.zip"
+ )
+
+@app.get("/health")
+def health_check():
+ return {"status": "ok", "message": "Backend is running"}
+
+def detect_edit_type(user_message: str) -> List[str]:
+  """
+  Return list of detected edit types in user's message.
+  Examples: ["title"], ["background"], ["logo"], ["text"], ...
+  Using conservative keyword matching.
+  """
+  msg = (user_message or "").lower()
+  types = []
+  if re.search(r'\b(title|website name|page title|rename heading|rename title)\b', msg):
+    types.append("title")
+  if re.search(r'\b(background|bg|background-color|theme color|page color)\b', msg):
+    types.append("background")
+  if re.search(r'\b(logo|brand image|site logo|logo file|i don\'t like logo|dont like logo)\b', msg):
+    types.append("logo")
+  if re.search(r'\b(navbar|header|footer|hero|button|paragraph|text|heading|cta|call to action)\b', msg):
+    types.append("ui_text")
+  if re.search(r"replace\s+['\"].+?['\"]\s+with\s+['\"].+?['\"]", msg):
+    types.append("replace")
+  if not types:
+    types.append("general") # fallback - will still use small file set
+  return list(dict.fromkeys(types))
+
+
+def read_small_file_set(project_dir: str, user_message: str) -> Dict[str, str]:
+  """
+  Very small, targeted file reader. Returns a mapping {rel_path: content}
+  based on the edit types detected in user_message.
+
+  Rules:
+  - title -> dist/index.html, public/index.html, (src/index.html)
+  - background -> dist/**/*.css, src/index.css, src/global.css
+  - theme -> tailwind.config.js
+  - logo -> dist/index.html, public/*logo*, src/components/*logo*, public/logo.*
+  - ui_text -> search only these common component files and index.html
+  - replace/general -> a small set: index.html + main app + a couple css files
+  """
+  files: Dict[str, str] = {}
+  edit_types = detect_edit_type(user_message)
+
+  # helper to load if exists
+  def try_add(rel):
+    abs_path = os.path.join(project_dir, rel)
+    if os.path.exists(abs_path) and os.path.isfile(abs_path):
+      try:
+        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+          files[rel] = f.read()
+      except Exception:
+        # skip unreadable
+        pass
+
+  # candidate list (small and common)
+  candidates = set()
+  # Always include dist/index.html if present (fast read)
+  candidates.add(os.path.join("dist", "index.html"))
+  candidates.add("index.html")
+  candidates.add(os.path.join("public", "index.html"))
+
+  for t in edit_types:
+    if t == "title":
+      candidates.add(os.path.join("dist", "index.html"))
+      candidates.add("index.html")
+      candidates.add(os.path.join("public", "index.html"))
+    elif t == "background":
+      # prefer dist css then src css
+      # add a couple of typical CSS file names (very limited)
+      for pattern in ["dist/**/*.css", "dist/*.css", "src/index.css", "src/global.css", "src/styles.css"]:
+        for p in glob.glob(os.path.join(project_dir, pattern), recursive=True):
+          # store as rel path
+          rel = os.path.relpath(p, project_dir)
+          candidates.add(rel)
+    elif t == "theme":
+      candidates = set()
+
+      # Priority search order
+      search_patterns = [
+        "dist/**/*.css",
+        "dist/*.css",
+        "src/index.css",
+        "src/global.css",
+        "src/styles.css",
+        "tailwind.config.js",    # NEW
+        "postcss.config.js"     # NEW
+      ]
+
+      for pattern in search_patterns:
+        paths = glob.glob(os.path.join(project_dir, pattern), recursive=True)
+        for p in paths:
+          rel = os.path.relpath(p, project_dir)
+          candidates.add(rel)
+
+      if not candidates:
+        raise HTTPException(500, "No CSS or Tailwind config file found to update background")
+
+      return {
+        "success": True,
+        "found_files": list(candidates)
+      }
+
+    elif t == "logo":
+      # index + common logo locations
+      candidates.add(os.path.join("dist", "index.html"))
+      candidates.add("index.html")
+      candidates.add(os.path.join("public", "logo.png"))
+      candidates.add(os.path.join("public", "logo.svg"))
+      candidates.add(os.path.join("src", "App.jsx"))
+      # try to find files under src/components that have 'logo' in name
+      for p in glob.glob(os.path.join(project_dir, "src", "components", "*logo*.*"), recursive=False):
+        candidates.add(os.path.relpath(p, project_dir))
+      # also try public images with logo
+      for p in glob.glob(os.path.join(project_dir, "public", "*logo*.*")):
+        candidates.add(os.path.relpath(p, project_dir))
+    elif t == "ui_text":
+      candidates.add(os.path.join("dist", "index.html"))
+      candidates.add("index.html")
+      # add main app components
+      candidates.add(os.path.join("src", "App.jsx"))
+      candidates.add(os.path.join("src", "main.jsx"))
+      candidates.add(os.path.join("src", "index.css"))
+      # try some components
+      for p in glob.glob(os.path.join(project_dir, "src", "components", "*.*")):
+        # limit to small set (no deep scan)
+        candidates.add(os.path.relpath(p, project_dir))
+    elif t == "replace":
+      # include dist html and css
+      candidates.add(os.path.join("dist", "index.html"))
+      candidates.add("index.html")
+      # a couple css files
+      candidates.add(os.path.join("src", "index.css"))
+      candidates.add(os.path.join("dist", "assets", "main.css"))
+
+    elif t == "general":
+      # conservative: index + main app + 1 css
+      candidates.add(os.path.join("dist", "index.html"))
+      candidates.add("index.html")
+      candidates.add(os.path.join("src", "App.jsx"))
+      candidates.add(os.path.join("src", "index.css"))
+
+  # Normalize and add only existing files (limit to ~50 files to be safe)
+  added = 0
+  for rel_candidate in list(candidates):
+    rel = rel_candidate.replace("\\", "/")
+    # some patterns might still be absolute; normalize
+    rel = rel.strip("./")
+    try_add(rel)
+    added += 1
+    if added >= 50:
+      break
+
+  # If empty: fall back to a very small set
+  if not files:
+    for fallback in ["index.html", os.path.join("dist", "index.html"), os.path.join("src", "App.jsx")]:
+      try_add(fallback)
+
+  return files
+
+
+def write_files(file_map: Dict[str, str], project_dir: str) -> None:
+  """
+  Safe writer for a dictionary {rel_path: content}.
+  Ensures directories exist and writes files atomically.
+  """
+  for rel, content in file_map.items():
+    rel = rel.lstrip("/\\")
+    abs_path = os.path.join(project_dir, rel)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    # atomic write: write to tmp then move
+    tmp_path = abs_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+      f.write(content)
+    shutil.move(tmp_path, abs_path)
+
+def apply_quick_edit(project_dir: str, user_message: str) -> Dict[str, Any]:
+  """
+  Handles extremely fast edits:
+  - TITLE
+  - BACKGROUND
+  Prevents interfering with rename-related instructions.
+  """
+  result = {"applied": False, "files": [], "reason": ""}
+
+  msg = user_message.lower().strip()
+
+  # Do not process quick-edit if rename-related
+  if "change name" in msg or "rename" in msg or "website name" in msg or "brand name" in msg:
+    return result
+
+  dist_index = os.path.join(project_dir, "dist", "index.html")
+  pub_index = os.path.join(project_dir, "public", "index.html")
+  touched = []
+
+  # --------------------------------------------------------
+  # 1. TITLE CHANGE
+  # --------------------------------------------------------
+  if any(x in msg for x in ["title", "page title", "tab title", "browser title"]):
+    m = re.search(r"(?:to|as)\s+(.*)$", user_message, re.IGNORECASE)
+    new_title = m.group(1).strip() if m else None
+
+    if not new_title:
+      return {"applied": False}
+
+    for idx in [dist_index, pub_index]:
+      if os.path.exists(idx):
+        with open(idx, "r", encoding="utf-8") as f:
+          html = f.read()
+
+        updated = re.sub(
+          r"<title>.*?</title>",
+          f"<title>{new_title}</title>",
+          html,
+          flags=re.DOTALL
+        )
+
+        if updated != html:
+          with open(idx, "w", encoding="utf-8") as f:
+            f.write(updated)
+          touched.append(os.path.relpath(idx, project_dir))
+
+    if touched:
+      return {
+        "applied": True,
+        "files": touched,
+        "reason": f"Updated <title> → {new_title}"
+      }
+
+  # --------------------------------------------------------
+  # 2. BACKGROUND COLOR
+  # --------------------------------------------------------
+  if any(x in msg for x in ["background", "bg", "background-color"]):
+    m = re.search(r"(?:to|as)\s+(#[0-9A-Fa-f]{3,6}|\w+)$", user_message)
+    if m:
+      color = m.group(1).strip()
+      css_candidates = [
+        os.path.join(project_dir, "src", "index.css"),
+        os.path.join(project_dir, "src", "global.css")
+      ]
+
+      for css_file in css_candidates:
+        if os.path.exists(css_file):
+          with open(css_file, "r", encoding="utf-8") as f:
+            css = f.read()
+
+          new_css = re.sub(
+            r"(body\s*{[^}]*background[^:]*:\s*)([^;]+)(;)",
+            fr"\1{color}\3",
+            css,
+            flags=re.DOTALL
+          )
+
+          if new_css != css:
+            with open(css_file, "w", encoding="utf-8") as f:
+              f.write(new_css)
+            touched.append(os.path.relpath(css_file, project_dir))
+
+      if touched:
+        return {
+          "applied": True,
+          "files": touched,
+          "reason": f"Updated background → {color}"
+        }
+
+  return result
+
+
+@app.post("/modify_via_prompt/{project_id}")
+async def modify_via_prompt(project_id: str, request: Request):
+  try:
+    data = await request.json()
+    user_message = data.get("message", "").strip()
+    msg_l = user_message.lower()
+
+    if not user_message:
+      raise HTTPException(400, "Message empty")
+
+    project_dir = os.path.join(PROJECTS_BASE_DIR, project_id)
+    if not os.path.exists(project_dir):
+      raise HTTPException(404, "Project not found")
+
+
+    quick = apply_quick_edit(project_dir, user_message)
+    if quick.get("applied"):
+      return {
+        "success": True,
+        "action": "refresh",
+        "updated_files": quick["files"],
+        "preview_url": f"/preview/{project_id}/index.html?t={int(time.time())}",
+        "message": quick["reason"]
+      }
+
+    # ------------------------------------------------------
+    # 2) NAME CHANGE — REQUIRES CLARIFICATION
+    # ------------------------------------------------------
+    rename_triggers = ["change name", "rename", "site name", "website name", "brand name"]
+
+    if any(x in msg_l for x in rename_triggers):
+
+      # Extract new name
+      m = re.search(r"(?:to|as)\s+(.*)$", user_message, re.IGNORECASE)
+
+      # No new name provided — ask clarification
+      if not m:
+        return {
+          "success": False,
+          "action": "ask_clarification",
+          "message": (
+            "You asked to change the name, but did not specify the new name.\n"
+            "Please tell me exactly what the new name should be."
+          )
+        }
+
+      # New name provided
+      new_name = m.group(1).strip()
+
+      wanted_files = {
+        "navbar.jsx": None,
+        "header.jsx": None,
+        "footer.jsx": None,
+        "app.jsx": None
+      }
+
+      for root, dirs, files in os.walk(os.path.join(project_dir, "src")):
+        for f in files:
+          lower = f.lower()
+          if lower in wanted_files:
+            wanted_files[lower] = os.path.join(root, f)
+
+      found_files = [p for p in wanted_files.values() if p]
+
+      if not found_files:
+        raise HTTPException(500, "Navbar/Header/Footer not found")
+
+      updated_files = []
+
+      for path in found_files:
+        with open(path, "r", encoding="utf-8") as f:
+          code = f.read()
+
+        updated = re.sub(
+          r"(<span[^>]*>)(.*?)(</span>)",
+          rf"\1{new_name}\3",
+          code,
+          count=1
+        )
+
+        with open(path, "w", encoding="utf-8") as f:
+          f.write(updated)
+
+        updated_files.append(os.path.relpath(path, project_dir))
+
+      run_npm_build(project_dir)
+
+      return {
+        "success": True,
+        "action": "refresh",
+        "updated_files": updated_files,
+        "preview_url": f"/preview/{project_id}/index.html?t={int(time.time())}",
+        "message": f"Updated name → {new_name}"
+      }
+
+    # ------------------------------------------------------
+    # 3) LLM FALLBACK
+    # ------------------------------------------------------
+    existing_small = read_small_file_set(project_dir, user_message)
+    ai_prompt = edit_prompt(user_message, existing_small)
+
+    client_async = genai.Client(api_key=API_KEY)
+    chat = client_async.aio.chats.create(model=CODE_GEN_MODEL)
+
+    full_text = ""
+    stream = await chat.send_message_stream([ai_prompt])
+    async for chunk in stream:
+      if getattr(chunk, "text", None):
+        full_text += chunk.text
+
+    updated_obj = safe_json_parse(full_text)
+    if not isinstance(updated_obj, dict):
+      raise HTTPException(500, "AI returned invalid JSON")
+
+    src_updates = []
+
+    for rel, content in updated_obj.items():
+      rel = rel.lstrip("/\\")
+      if rel.startswith("dist/"):
+        continue
+
+      abs_path = os.path.join(project_dir, rel)
+      os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
+      with open(abs_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+      src_updates.append(rel)
+
+    if any(p.startswith("src/") for p in src_updates):
+      if not run_npm_build(project_dir):
+        raise HTTPException(500, "Build failed")
+
+    return {
+      "success": True,
+      "action": "refresh",
+      "updated_files": src_updates,
+      "preview_url": f"/preview/{project_id}/index.html?t={int(time.time())}"
+    }
+
+  except Exception as e:
+    logger.exception("modify_via_prompt failed")
+    raise HTTPException(500, str(e))
+
+
+@app.post("/edit/{project_id}")
+async def edit_project(project_id: str, prompt: str = Form(...)):
+  """
+  FAST edit endpoint. Uses FAST_EDIT_PROMPT and passes only a small file set to the LLM.
+  """
+  project_dir = os.path.join(PROJECTS_BASE_DIR, project_id)
+  if not os.path.exists(project_dir):
+    raise HTTPException(status_code=404, detail="Project not found")
+
+  # read only a minimal set (based on prompt)
+  existing_small = read_small_file_set(project_dir, prompt)
+  if not existing_small:
+    raise HTTPException(status_code=500, detail="Project files are unreadable")
+
+  # FAST_PROMPT includes minimal context: only the keys we actually sent
+  FAST_EDIT_PROMPT = f"""
+You are an AI website code editing assistant.
+Your job is to perform **very small and fast edits** ONLY.
+
+
+────────────────────────────────────────
+ FAST EDIT RULES (STRICT)
+────────────────────────────────────────
+
+ TITLE CHANGES 
+If user wants to change: 
+### Important Instruction:
+
+- If a customer requests a name change, always ask for additional clarification, such as the website name or relevant context, before proceeding.
+
+- Do not generate images or visual representations of the website name. Always provide the output only as text.
+
+- title 
+- website name 
+- page title 
+- rename title 
+→ ONLY update <title> inside **dist/index.html** or **public/index.html**. 
+→ DO NOT modify other files. 
+→ DO NOT touch components or sources.
+
+ BACKGROUND COLOR CHANGES 
+If user wants to change: 
+- background 
+- bg 
+- background-color 
+- theme color 
+→ ONLY update CSS files: 
+  • dist/**/*.css 
+  • src/index.css 
+  • src/global.css 
+  • tailwind.config.js
+
+→ DO NOT modify HTML or JavaScript.
+
+ TEXT / LOGO / UI CHANGES 
+If user wants to change: 
+- logo 
+- navbar / footer / header 
+- hero section 
+- button text 
+- paragraph text 
+→ Update ONLY the file where the affected element exists. 
+→ DO NOT rewrite App.jsx unless absolutely necessary. 
+→ DO NOT regenerate project structure.
+
+ NO FULL REGENERATION 
+- Edit only **existing** files 
+- No new files unless explicitly asked 
+- No deleting files 
+- No restructuring 
+- No formatting changes beyond required edits 
+- Make the smallest possible change
+
+────────────────────────────────────────
+ OUTPUT FORMAT (VERY STRICT)
+────────────────────────────────────────
+
+Return ONLY pure JSON like this:
+
+{{
+ "relative/path/to/file": "FULL UPDATED FILE CONTENT",
+ "another/file.ext": "UPDATED CONTENT"
+}}
+
+ No markdown 
+ No comments 
+ No explanations 
+ No extra text
+
+────────────────────────────────────────
+
+USER REQUEST:
+\"\"\"{prompt}\"\"\"
+FILES SENT (keys):
+{list(existing_small.keys())}
+
+IMPORTANT: Return ONLY JSON mapping of relative path -> full updated file content.
+"""
+
+  async_client = genai.Client(api_key=API_KEY)
+  chat = async_client.aio.chats.create(model=CODE_GEN_MODEL)
+
+  full_text = ""
+  response_stream = await chat.send_message_stream([FAST_EDIT_PROMPT])
+  async for chunk in response_stream:
+    if getattr(chunk, "text", None):
+      full_text += chunk.text
+
+  updated_files = safe_json_parse(full_text)
+  if not isinstance(updated_files, dict) or not updated_files:
+    logger.error("edit_project: AI returned invalid JSON")
+    raise HTTPException(status_code=500, detail="AI returned invalid JSON")
+
+  # Safety filter and write only safe files
+  safe_updates = {}
+  for rel_path, content in updated_files.items():
+    rel_path = rel_path.lstrip("/\\")
+    if rel_path.startswith("../") or os.path.isabs(rel_path):
+      logger.warning(f"Skipping unsafe AI path: {rel_path}")
+      continue
+    # Accept only files we expect to change (small set) OR safe src/public
+    if rel_path in existing_small or rel_path.startswith("src/") or rel_path.startswith("public/") or rel_path.startswith("dist/"):
+      safe_updates[rel_path] = content
+
+  if not safe_updates:
+    raise HTTPException(status_code=400, detail="AI returned no safe changes")
+
+  write_files(safe_updates, project_dir)
+
+  # Build only if src/ changed
+  if any(p.startswith("src/") for p in safe_updates):
+    if not run_npm_build(project_dir):
+      raise HTTPException(status_code=500, detail="Build failed after edit")
+
+  return {
+    "success": True,
+    "message": "Edit applied successfully (FAST MODE)",
+    "updated_files": list(safe_updates.keys()),
+    "preview_url": f"/preview/{project_id}/index.html?t={int(time.time())}"
+  }
+@app.options("/chat")
+async def chat_options():
+    return JSONResponse(status_code=200, content={"status": "ok"})
+
+from fastapi import Request, UploadFile
+from fastapi.responses import JSONResponse
+
+
+@app.post("/chat")
+async def chat_endpoint(request: Request):
+    global current_project_info
+    global chat_context
+
+    try:
+        user_message = ""
+        screenshot_files = []
+        temp_file_paths = []
+
+        content_type = request.headers.get("content-type", "")
+
+        # ------------------------------------------------------
+        # INPUT PARSING (JSON / MULTIPART)
+        # ------------------------------------------------------
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            user_message = (form.get("message") or "").strip()
+
+            # Extract and validate screenshot files
+            for field_name, field_value in form.items():
+                if isinstance(field_value, UploadFile):
+                    # Validate file type (images only)
+                    if not field_value.content_type.startswith("image/"):
+                        logger.warning(f"Rejected non-image file: {field_value.filename} ({field_value.content_type})")
+                        continue
+
+                    # Validate file size (max 10MB per file)
+                    max_size = 10 * 1024 * 1024  # 10MB
+                    if hasattr(field_value, 'size') and field_value.size > max_size:
+                        logger.warning(f"Rejected oversized file: {field_value.filename} ({field_value.size} bytes)")
+                        continue
+
+                    screenshot_files.append(field_value)
+
+            # Save files to temporary directory
+            if screenshot_files:
+                os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+                for i, file in enumerate(screenshot_files):
+                    temp_filename = f"{uuid.uuid4()}_{file.filename}"
+                    temp_path = os.path.join(TEMP_UPLOAD_DIR, temp_filename)
+
+                    try:
+                        with open(temp_path, "wb") as buffer:
+                            shutil.copyfileobj(file.file, buffer)
+                        temp_file_paths.append(temp_path)
+                        logger.info(f"Saved screenshot {i+1}: {file.filename} -> {temp_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to save file {file.filename}: {e}")
+                        continue
+
+                print(f"DEBUG: Received multipart form data. Message: '{user_message}', Screenshot files count: {len(screenshot_files)}, Saved: {len(temp_file_paths)}")
+
+        else:
+            data = await request.json()
+            user_message = (data.get("message") or "").strip()
+
+        if not user_message and not screenshot_files:
+            # Clean up any temp files if no valid input
+            for path in temp_file_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+            return {"success": False, "reply": "No input provided."}
+
+        msg = user_message.lower()
+
+        # ------------------------------------------------------
+        # IMAGE CONTEXT (PERSIST ONCE)
+        # ------------------------------------------------------
+        if screenshot_files:
+            chat_context["has_images"] = True
+            chat_context["image_count"] = len(screenshot_files)
+            # Inform user about attached images
+            image_acknowledgment = f"✅ Received {len(screenshot_files)} image reference(s) for your website design."
+            if user_message:
+                user_message += f"\n\n{image_acknowledgment}"
+            else:
+                user_message = image_acknowledgment
+
+        # ------------------------------------------------------
+        # 🔥 EXPLICIT START GENERATION (TEXT OVERRIDES IMAGE)
+        # ------------------------------------------------------
+        start_keywords = [
+            "generate", "build", "create", "start",
+            "develop", "make", "design"
+        ]
+
+        if any(k in msg for k in start_keywords):
+            prompt = (
+                f"Build a web application for the following requirement:\n\n"
+                f"{user_message}\n\n"
+            )
+
+            if chat_context.get("has_images"):
+                prompt += (
+                    f"Use {chat_context.get('image_count')} uploaded image(s) "
+                    "only as visual reference.\n"
+                )
+
+            chat_context.clear()
+
+            return {
+                "success": True,
+                "action": "start_generation",
+                "reply": (
+                    "Starting the build now.\n"
+                    "I’ll use the uploaded images as visual reference."
+                    if screenshot_files or chat_context.get("has_images")
+                    else "Starting the build now."
+                ),
+                "prompt": prompt,
+                "is_edit": False
+            }
+
+        # ------------------------------------------------------
+        # IMAGE + TEXT → REQUEST CONFIRMATION (ONCE)
+        # ------------------------------------------------------
+        if chat_context.get("has_images") and user_message and not chat_context.get("awaiting_confirmation"):
+            prompt = (
+                f"User wants to build:\n{user_message}\n\n"
+                f"Use {chat_context.get('image_count')} uploaded image(s) "
+                "only as visual inspiration."
+            )
+
+            chat_context["pending_prompt"] = prompt
+            chat_context["awaiting_confirmation"] = True
+
+            return {
+                "success": True,
+                "action": "request_confirmation",
+                "reply": (
+                    "I’ve received your screenshots and your description.\n\n"
+                    f"You want to build **{user_message}** using the images as reference.\n\n"
+                    "Should I proceed?"
+                ),
+                "prompt": prompt,
+                "is_edit": False
+            }
+
+        # ------------------------------------------------------
+        # CONFIRMATION RESPONSE
+        # ------------------------------------------------------
+        if chat_context.get("awaiting_confirmation"):
+            positive = ["yes", "y", "ok", "sure", "start", "proceed", "go ahead"]
+            negative = ["no", "cancel", "stop"]
+
+            if any(p in msg for p in positive):
+                prompt = chat_context.get("pending_prompt")
+                chat_context.clear()
+
+                return {
+                    "success": True,
+                    "action": "start_generation",
+                    "reply": "Great! I’m starting the build now.",
+                    "prompt": prompt,
+                    "is_edit": False
+                }
+
+            if any(n in msg for n in negative):
+                chat_context.clear()
+                return {
+                    "success": True,
+                    "action": "cancel_action",
+                    "reply": "Okay, canceled. What would you like to do instead?"
+                }
+
+        # ------------------------------------------------------
+        # EDIT INTENT
+        # ------------------------------------------------------
+        edit_keywords = ["change", "modify", "update", "edit", "replace", "fix"]
+        edit_targets = ["navbar", "footer", "button", "text", "color", ".jsx", ".css"]
+
+        if any(k in msg for k in edit_keywords) and any(t in msg for t in edit_targets):
+            if not current_project_info:
+                return {"success": True, "reply": "No website exists yet.", "action": "none"}
+
+            return {
+                "success": True,
+                "action": "modify_via_prompt",
+                "reply": "Applying your update...",
+                "project_id": current_project_info["id"],
+                "message": user_message
+            }
+
+ 
+        if not client:
+            # Clean up temp files
+            for path in temp_file_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+            return {
+                "success": True, 
+                "reply": "AI service is currently unavailable. Please try again later.", 
+                "action": "none",
+                "image_url": None
+            }
+
+        SYSTEM_INSTRUCTION = """
+You are WORTUAL ADVANCE CODING, an AI website builder assistant.
+
+RULES:
+- You CAN see uploaded images (they are references).
+- Never say you cannot view images.
+- Avoid unnecessary follow-up questions.
+- If intent is clear, proceed confidently.
+
+Return ONLY valid JSON.
+"""
+
+        async_client = genai.Client(api_key=API_KEY)
+        chat = async_client.aio.chats.create(model=CHAT_MODEL, config={"system_instruction": SYSTEM_INSTRUCTION})
+
+        content_parts = [user_message]
+
+        # Add uploaded images to the prompt
+        for path in temp_file_paths:
+            try:
+                content_parts.append(genai.types.Part.from_file(path))
+                logger.info(f"Attached image {os.path.basename(path)} to chat prompt.")
+            except Exception as e:
+                logger.warning(f"Could not load image file {path} for chat: {e}")
+
+        full_text = ""
+        response_stream = await chat.send_message_stream(content_parts)
+        async for chunk in response_stream:
+            if chunk.text:
+                full_text += chunk.text
+
+        ai_json = safe_json_parse(full_text)
+
+        if not ai_json or "action" not in ai_json:
+            return {"success": True, "reply": "How can I help you build your website?", "action": "none", "image_url": None}
+
+        return {
+            "success": True,
+            "reply": ai_json.get("reply"),
+            "action": ai_json.get("action"),
+            "prompt": ai_json.get("prompt"),
+            "is_edit": ai_json.get("is_edit", False),
+            "image_url": ai_json.get("image_url", None)
+        }
+
+    except Exception as e:
+        logger.exception("chat_endpoint failed")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "reply": str(e)}
+        )
+
+@app.get("/preview/{project_id}/{path:path}")
+async def serve_preview_files(project_id: str, path: str):
+  """
+  Dynamically serves built files for a specific project.
+  Supports React/Vite SPA fallback for missing routes.
+  """
+  project_dist_dir = os.path.join(PROJECTS_BASE_DIR, project_id, "dist")
+
+  if not os.path.exists(project_dist_dir):
+    logger.error(f"Preview request failed: dist folder missing for {project_id}")
+    raise HTTPException(status_code=404, detail=f"Project build not found for {project_id}")
+
+  # Compute file path within dist
+  file_path = os.path.join(project_dist_dir, path)
+
+  # Security: Prevent directory traversal
+  if not os.path.abspath(file_path).startswith(os.path.abspath(project_dist_dir)):
+    raise HTTPException(status_code=403, detail="Forbidden access outside project directory")
+
+  # If path is a directory, default to index.html
+  if os.path.isdir(file_path):
+    file_path = os.path.join(file_path, "index.html")
+
+  # If the requested file exists
+  if os.path.exists(file_path) and os.path.isfile(file_path):
+    return FileResponse(file_path)
+
+  # Fallback for React/Vite single-page routing
+  index_path = os.path.join(project_dist_dir, "index.html")
+  if os.path.exists(index_path):
+    logger.warning(f"SPA fallback triggered for {project_id}: {path}")
+    return FileResponse(index_path)
+
+  logger.error(f"File not found in preview for {project_id}: {path}")
+  raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+
+@app.get("/preview/{project_id}")
+async def serve_preview_root(project_id: str):
+  """
+  Serves the root index.html for the project's preview.
+  Example: GET /preview/<project_id>
+  """
+  project_dist_dir = os.path.join(PROJECTS_BASE_DIR, project_id, "dist")
+  index_path = os.path.join(project_dist_dir, "index.html")
+
+  if not os.path.exists(index_path):
+    logger.error(f"index.html missing for preview {project_id}")
+    raise HTTPException(status_code=404, detail=f"index.html not found for project {project_id}")
+
+  return FileResponse(index_path)
+@app.get("/preview/{project_id}/")
+async def serve_preview_index(project_id: str):
+ """Serves the index.html for the project root."""
+ return await serve_preview_files(project_id, "index.html")

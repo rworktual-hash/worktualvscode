@@ -1,0 +1,104 @@
+{
+  "name": "vibecoding",
+  "displayName": "VibeCoding",
+  "description": "AI coding assistant with code generation",
+  "version": "0.0.2",
+  "publisher": "vibe",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onView:vibecoding.chatView",
+    "onCommand:vibecoding.chat"
+  ],
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aiCodeSidebar",
+          "title": "AI Code",
+          "icon": "media/logo.png"
+        }
+      ]
+    },
+    "views": {
+      "aiCodeSidebar": [
+        {
+          "id": "vibecoding.chatView",
+          "name": "AI Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "vibecoding.chat",
+        "title": "Open VibeCoding Chat"
+      }
+    ],
+    "configuration": {
+      "title": "VibeCoding",
+      "properties": {
+        "vibecoding.backend": {
+          "type": "string",
+          "enum": [
+            "ollama",
+            "gemini"
+          ],
+          "default": "gemini",
+          "description": "AI backend to use for code generation (ollama for local, gemini for Google AI)"
+        },
+        "vibecoding.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Google Gemini API Key (required when using Gemini backend)"
+        },
+        "vibecoding.geminiModel": {
+          "type": "string",
+          "default": "gemini-1.5-pro",
+          "description": "Gemini model to use (e.g., gemini-1.5-pro, gemini-1.5-flash)"
+        },
+        "vibecoding.ollamaModel": {
+          "type": "string",
+          "default": "qwen2.5-coder:latest",
+          "description": "Ollama model to use"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "@types/node": "16.x",
+    "typescript": "^5.0.4"
+  },
+  "keywords": [
+    "ai",
+    "coding",
+    "assistant",
+    "ollama"
+  ],
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/vibe/vibecoding/issues"
+  },
+  "homepage": "https://github.com/vibe/vibecoding#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vibe/vibecoding.git"
+  },
+  "files": [
+    "out/**/*",
+    "media/**/*",
+    "python/**/*"
+  ]
+}

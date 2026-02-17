@@ -1,0 +1,28 @@
+<parameter name="content"># TODO: Fix process_message() to use Gemini API
+
+## Current State
+- Gemini imports and configuration already exist in backend.py
+- `check_gemini_available()` function works correctly
+- BUT `process_message()` still references Ollama:
+  - Uses undefined `OLLAMA_URL` variable
+  - Makes HTTP requests to Ollama endpoint
+  - Error messages mention Ollama server
+
+## Steps to Fix
+1. [ ] Update `process_message()` to use Gemini API (`client.models.generate_content()`)
+2. [ ] Replace Ollama error messages with Gemini-appropriate messages
+3. [ ] Update comments to reference Gemini
+4. [ ] Test the integration
+
+## Changes Required
+- Line ~1622: Update greeting comment to reference Gemini
+- Line ~1628-1630: Update availability check error message
+- Line ~1641: Replace `requests.post(OLLAMA_URL, ...)` with Gemini client call
+- Line ~1648-1653: Update error handling messages
+- Line ~1663: Update ready signal comment
+- Line ~1839: Update comment to reference Gemini
+
+## Testing
+- Run backend.py and test with a simple message
+- Verify Gemini API calls work
+</parameter>

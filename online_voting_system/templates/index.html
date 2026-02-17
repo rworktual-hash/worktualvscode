@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+    <h1>Welcome to the Online Voting System!</h1>
+    <p>Current Active Elections:</p>
+    {% if elections %}
+        <ul class="election-list">
+            {% for election in elections %}
+                <li>
+                    <a href="{{ url_for('election_detail', election_id=election.id) }}">{{ election.title }}</a>
+                    <p>{{ election.description }}</p>
+                    <a href="{{ url_for('election_results', election_id=election.id) }}" class="results-link">View Results</a>
+                </li>
+            {% endfor %}
+        </ul>
+    {% else %}
+        <p>No active elections at the moment. Check back later!</p>
+        {% if is_admin() %}
+            <p><a href="{{ url_for('create_election') }}" class="btn btn-primary">Create a new election</a></p>
+        {% endif %}
+    {% endif %}
+{% endblock %}

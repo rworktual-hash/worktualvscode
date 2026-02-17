@@ -1,0 +1,303 @@
+<parameter name="content">import * as vscode from 'vscode';
+import * as path from 'path';
+import * as child_process from 'child_process';
+import * as fs from 'fs';
+
+export class Backend implements vscode.WebviewViewProvider {
+    private context: vscode.ExtensionContext;
+    private view: vscode.WebviewView | undefined;
+    private pythonProcess: child_process.ChildProcess | undefined;
+    private outputBuffer: string = '';
+    private isReady: boolean = false;
+
+    constructor(context: vscode.ExtensionContext) {
+        this.context = context;
+    }
+
+    resolveWebviewView(webviewView: vscode.WebviewView, context: vscode.WebviewViewResolveContext, token: vscode.CancellationToken): void {
+        this.view = webviewView;
+        
+        webviewView.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [
+                vscode.Uri.file(path.join(this.context.extensionPath, 'media'))
+            ]
+        };
+
+        webviewView.webview.html = this.getWebviewContent();
+
+        webviewView.webview.onDidReceiveMessage((message: any) => {
+            switch (message.command) {
+                case 'sendMessage':
+                    this.handleMessage(message.text, message.files);
+                    return;
+                case 'openPreview':
+                    if (message.url) {
+                        vscode.env.openExternal(vscode.Uri.parse(message.url));
+                    }
+                    return;
+                case 'searchFiles':
+                    this.handleSearchFiles(message.keyword, message.fileType);
+                    return;
+                case 'searchFolders':
+                    this.handleSearchFolders(message.keyword);
+                    return;
+                case 'searchInFiles':
+                    this.handleSearchInFiles(message.keyword, message.filePattern);
+                    return;
+                case 'getFileInfo':
+                    this.handleGetFileInfo(message.path);
+                    return;
+            }
+        }, undefined, this.context.subscriptions);
+
+        this.startPythonBackend();
+    }
+
+    private getWebviewContent(): string {
+        const htmlPath = path.join(this.context.extensionPath, 'media', 'chat.html');
+        try {
+            return fs.readFileSync(htmlPath, 'utf8');
+        } catch (error) {
+            return this.getDefaultHtml();
+        }
+    }
+
+    private getDefaultHtml(): string {
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Code Assistant</title>
+    <style>
+        body { font-family: var(--vscode-font-family); background-color: var(--vscode-editor-background); color: var(--vscode-editor-foreground); margin: 0; padding: 20px; }
+        #chat-container { height: 80vh; overflow-y: auto; border: 1px solid var(--vscode-panel-border); padding: 10px; margin-bottom: 10px; }
+        #input-container { display: flex; gap: 10px; }
+        #user-input { flex: 1; padding: 10px; background-color: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); }
+        button { padding: 10px 20px; background-color: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; cursor: pointer; }
+        button:hover { background-color: var(--vscode-button-hoverBackground); }
+        .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .user-message { background-color: var(--vscode-editor-inactiveSelectionBackground); }
+        .assistant-message { background-color: var(--vscode-editor-selectionBackground); }
+        .typing { color: var(--vscode-descriptionForeground); font-style: italic; }
+    </style>
+</head>
+<body>
+    <div id="chat-container"></div>
+    <div id="input-container">
+        <input type="text" id="user-input" placeholder="Type your message..." />
+        <button onclick="sendMessage()">Send</button>
+    </div>
+    <script>
+        const vscode = acquireVsCodeApi();
+        const chatContainer = document.getElementById('chat-container');
+        const userInput = document.getElementById('user-input');
+        let isTyping = false;
+
+        function sendMessage() {
+            const text = userInput.value.trim();
+            if (text && !isTyping) {
+                addMessage(text, 'user');
+                vscode.postMessage({ command: 'sendMessage', text: text });
+                userInput.value = '';
+                isTyping = true;
+                addMessage('...', 'assistant', true);
+            }
+        }
+
+        function addMessage(text, sender, isTyping = false) {
+            const div = document.createElement('div');
+            div.className = 'message ' + sender + '-message';
+            if (isTyping) { div.classList.add('typing'); div.id = 'typing-indicator'; }
+            div.textContent = (sender === 'user' ? 'You: ' : 'AI: ') + text;
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        window.addEventListener('message', event => {
+            const message = event.data;
+            switch (message.type) {
+                case 'response': case 'error': case 'ready':
+                    const typing = document.getElementById('typing-indicator');
+                    if (typing) { typing.remove(); }
+                    isTyping = false;
+                    addMessage(message.text, 'assistant');
+                    break;
+                case 'status':
+                    const statusTyping = document.getElementById('typing-indicator');
+                    if (statusTyping) { statusTyping.textContent = 'AI: ' + message.text; statusTyping.classList.remove('typing'); }
+                    break;
+            }
+        });
+
+        userInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') { sendMessage(); } });
+    </script>
+</body>
+</html>`;
+    }
+
+    private startPythonBackend(): void {
+        const pythonScript = path.join(this.context.extensionPath, 'python', 'backend.py');
+        console.log('Starting Python backend:', pythonScript);
+
+        if (!fs.existsSync(pythonScript)) {
+            console.error('Python backend script not found:', pythonScript);
+            if (this.view) {
+                this.view.webview.postMessage({ type: 'error', text: `Backend script not found: ${pythonScript}` });
+            }
+            return;
+        }
+
+        const pythonCommand = process.platform === 'win32' ? 'python' : 'python3';
+
+        try {
+            this.pythonProcess = child_process.spawn(pythonCommand, [pythonScript], {
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+        } catch (error: any) {
+            console.error('Failed to spawn Python process:', error);
+            if (this.view) {
+                this.view.webview.postMessage({ type: 'error', text: `Failed to start Python: ${error}` });
+            }
+            return;
+        }
+
+        if (this.view) {
+            this.view.webview.postMessage({ type: 'status', text: 'Starting AI Assistant...' });
+        }
+
+        this.pythonProcess.stdout?.on('data', (data: Buffer) => {
+            const text = data.toString();
+            console.log('Python stdout:', text);
+            this.outputBuffer += text;
+            const lines = this.outputBuffer.split('\n');
+            this.outputBuffer = lines.pop() || '';
+            for (const line of lines) {
+                if (line.trim()) {
+                    try {
+                        const message = JSON.parse(line.trim());
+                        this.handlePythonMessage(message);
+                    } catch (e) { console.error('Failed to parse Python message:', line, e); }
+                }
+            }
+        });
+
+        this.pythonProcess.stderr?.on('data', (data: Buffer) => {
+            const errorText = data.toString();
+            console.error(`Python backend error: ${errorText}`);
+            if (this.view) {
+                this.view.webview.postMessage({ type: 'error', text: `Backend: ${errorText}` });
+            }
+        });
+
+        this.pythonProcess.on('close', (code: number | null) => {
+            console.log(`Python backend exited with code ${code}`);
+            this.isReady = false;
+            if (this.view) {
+                this.view.webview.postMessage({ type: 'error', text: 'AI Assistant disconnected' });
+            }
+        });
+
+        this.pythonProcess.on('error', (error: Error) => {
+            console.error('Failed to start Python backend:', error);
+            if (this.view) {
+                this.view.webview.postMessage({ type: 'error', text: `Failed to start AI Assistant: ${error.message}` });
+            }
+        });
+
+        setTimeout(() => {
+            if (!this.isReady && this.view) {
+                console.error('Python backend failed to become ready within 10 seconds');
+                this.view.webview.postMessage({ type: 'error', text: 'AI Assistant failed to start. Check Python and Gemini API.' });
+            }
+        }, 10000);
+    }
+
+    private handlePythonMessage(message: any): void {
+        if (!this.view) { return; }
+        console.log('Handling message:', message);
+        switch (message.type) {
+            case 'ready':
+                console.log('Python backend is ready');
+                this.isReady = true;
+                this.view.webview.postMessage(message);
+                break;
+            case 'response': case 'error': case 'status':
+                this.view.webview.postMessage(message);
+                break;
+            default:
+                console.log('Unknown message type:', message.type);
+        }
+    }
+
+    private handleSearchFiles(keyword: string, fileType?: string): void {
+        if (!this.isReady || !this.pythonProcess || this.pythonProcess.killed) {
+            if (this.view) { this.view.webview.postMessage({ type: 'error', text: 'AI Assistant is not ready.' }); }
+            return;
+        }
+        const message = JSON.stringify({ type: 'message', text: `search files with keyword "${keyword}"${fileType ? ` and type ${fileType}` : ''}` }) + '\n';
+        try { this.pythonProcess.stdin?.write(message); } catch (error) { console.error('Failed to send search request:', error); }
+    }
+
+    private handleSearchFolders(keyword: string): void {
+        if (!this.isReady || !this.pythonProcess || this.pythonProcess.killed) {
+            if (this.view) { this.view.webview.postMessage({ type: 'error', text: 'AI Assistant is not ready.' }); }
+            return;
+        }
+        const message = JSON.stringify({ type: 'message', text: `search folders with keyword "${keyword}"` }) + '\n';
+        try { this.pythonProcess.stdin?.write(message); } catch (error) { console.error('Failed to send search request:', error); }
+    }
+
+    private handleSearchInFiles(keyword: string, filePattern?: string): void {
+        if (!this.isReady || !this.pythonProcess || this.pythonProcess.killed) {
+            if (this.view) { this.view.webview.postMessage({ type: 'error', text: 'AI Assistant is not ready.' }); }
+            return;
+        }
+        const message = JSON.stringify({ type: 'message', text: `search in files for "${keyword}"${filePattern ? ` in ${filePattern} files` : ''}` }) + '\n';
+        try { this.pythonProcess.stdin?.write(message); } catch (error) { console.error('Failed to send search request:', error); }
+    }
+
+    private handleGetFileInfo(filePath: string): void {
+        if (!this.isReady || !this.pythonProcess || this.pythonProcess.killed) {
+            if (this.view) { this.view.webview.postMessage({ type: 'error', text: 'AI Assistant is not ready.' }); }
+            return;
+        }
+        const message = JSON.stringify({ type: 'message', text: `get file info for ${filePath}` }) + '\n';
+        try { this.pythonProcess.stdin?.write(message); } catch (error) { console.error('Failed to send file info request:', error); }
+    }
+
+    private handleMessage(text: string, files?: any[]): void {
+        console.log('Handling message, isReady:', this.isReady);
+        
+        if (this.view) { this.view.webview.postMessage({ type: 'thinking' }); }
+        
+        if (!this.isReady) {
+            if (this.view) { this.view.webview.postMessage({ type: 'error', text: 'AI Assistant is not ready yet.' }); }
+            return;
+        }
+
+        if (this.pythonProcess && this.pythonProcess.stdin && !this.pythonProcess.killed) {
+            const messageObj: any = { type: 'message', text: text };
+            if (files && files.length > 0) { messageObj.files = files; }
+            const message = JSON.stringify(messageObj) + '\n';
+            try {
+                this.pythonProcess.stdin.write(message);
+                console.log('Message sent successfully');
+            } catch (error: any) {
+                console.error('Failed to write to Python stdin:', error);
+                if (this.view) { this.view.webview.postMessage({ type: 'error', text: `Failed to send message: ${error}` }); }
+            }
+        } else {
+            if (this.view) { this.view.webview.postMessage({ type: 'error', text: 'AI Assistant not available.' }); }
+        }
+    }
+
+    dispose(): void {
+        if (this.pythonProcess) {
+            this.pythonProcess.stdin?.end();
+            this.pythonProcess.kill();
+        }
+    }
+}
+</parameter>

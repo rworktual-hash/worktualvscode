@@ -37,7 +37,7 @@ send({"status": "Backend ready"})
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-GEMINI_MODEL = "gemini-3-pro-preview"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
 # load_dotenv()
@@ -78,7 +78,7 @@ async def generate_text(request: PromptRequest):
 # client = genai.Client(api_key=GEMINI_API_KEY)
 
 # # Website Building Backend Configuration
-WEBSITE_BACKEND_URL = "http://127.0.0.1:8000"
+# WEBSITE_BACKEND_URL = "http://127.0.0.1:8000"
 
 # Global workspace path - will be set from VS Code: extension
 # Use the parent directory of the python folder (extension root) as default
@@ -108,6 +108,20 @@ If the user says: hi, hello, hey
 Return EXACTLY:
 Hello, Good to see you.!
 
+FOLDER CREATION RULE:
+Before creating any file, ensure its parent folder exists.
+If the folder doesn't exist, create it first using create_folder action.
+Always create folders before files in a separate JSON response.
+
+----------------------------------------
+FILE CREATION WORKFLOW:
+1. Always verify parent directory exists before creating files
+2. If creating multiple files, ensure folders are created first
+3. Use create_folder action for each unique folder path before files
+4. For nested paths like "src/utils/helper.py":
+   - First create "src" folder
+   - Then create "src/utils" folder  
+   - Finally create "src/utils/helper.py" file
 ----------------------------------------
 AVAILABLE ACTIONS
 ----------------------------------------
@@ -134,7 +148,8 @@ CREATE PROJECT (multiple files):
       "path": "<relative_path/file1.py>",
       "content": "<full file content with \\n>"
     }
-  ]
+  ],
+    "ensure_folders": true
 }
 
 UPDATE FILE (overwrite entire file):
@@ -270,20 +285,31 @@ def create_folder(folder):
     except OSError as e:
         return f"[ERROR] {e}"
 
-
 def create_project(folder, files):
     """
     Create a project with multiple files and folders.
-    This is useful for creating complete project structures.
+    Enhanced with better error handling and logging.
     """
     results = []
+    debug_info = []
     
     try:
+        # Validate inputs
+        if not folder:
+            return "[ERROR] Folder name cannot be empty"
+        if not files or not isinstance(files, list):
+            return "[ERROR] Files must be a non-empty list"
+        
+        # Sanitize folder name (remove any path traversal attempts)
+        folder = os.path.basename(folder.strip())
+        
         # Create main project folder
         project_path = os.path.join(WORKSPACE_PATH, folder)
+        debug_info.append(f"Project path: {project_path}")
+        
         if not os.path.exists(project_path):
             os.makedirs(project_path, exist_ok=True)
-            results.append(f"[OK] Created project folder: {project_path}")
+            results.append(f"[OK] Created project folder: {folder}")
         else:
             results.append(f"[INFO] Project folder '{folder}' already exists.")
         
@@ -292,39 +318,74 @@ def create_project(folder, files):
         updated_count = 0
         error_count = 0
         
-        for file_info in files:
+        for idx, file_info in enumerate(files):
             try:
-                file_path = file_info.get("path", "")
-                content = file_info.get("content", "")
-                
-                if not file_path:
-                    results.append(f"[ERROR] Missing path for file")
+                # Validate file info structure
+                if not isinstance(file_info, dict):
+                    results.append(f"[ERROR] File #{idx+1}: Invalid format (expected dict, got {type(file_info)})")
                     error_count += 1
                     continue
                 
-                # Handle both relative paths and paths within the project folder
-                if file_path.startswith(folder + "/") or file_path.startswith(folder + "\\"):
+                file_path = file_info.get("path", "").strip()
+                content = file_info.get("content", "")
+                
+                if not file_path:
+                    results.append(f"[ERROR] File #{idx+1}: Missing path")
+                    error_count += 1
+                    continue
+                
+                # Sanitize file path (prevent path traversal)
+                file_path = file_path.replace('\\', '/').strip('/')
+                if '..' in file_path or file_path.startswith('/'):
+                    results.append(f"[ERROR] File #{idx+1}: Invalid path '{file_path}' (path traversal detected)")
+                    error_count += 1
+                    continue
+                
+                debug_info.append(f"Processing file {idx+1}: {file_path}")
+                
+                # Handle content encoding issues
+                if content and isinstance(content, str):
+                    # Fix common JSON escaping issues
+                    content = content.replace('\\n', '\n')
+                    content = content.replace('\\t', '\t')
+                    content = content.replace('\\"', '"')
+                    content = content.replace('\\\\', '\\')
+                
+                # Determine full file path
+                if file_path.startswith(folder):
                     # Path already includes project folder
+                    relative_path = file_path[len(folder):].lstrip('/')
                     full_file_path = os.path.join(WORKSPACE_PATH, file_path)
                 else:
                     # Path is relative to project folder
+                    relative_path = file_path
                     full_file_path = os.path.join(project_path, file_path)
+                
+                debug_info.append(f"Full path: {full_file_path}")
                 
                 # Create parent directories if needed
                 parent_dir = os.path.dirname(full_file_path)
                 if parent_dir and not os.path.exists(parent_dir):
                     os.makedirs(parent_dir, exist_ok=True)
-                    results.append(f"[OK] Created directory: {os.path.relpath(parent_dir, WORKSPACE_PATH)}")
+                    rel_parent = os.path.relpath(parent_dir, WORKSPACE_PATH)
+                    results.append(f"[OK] Created directory: {rel_parent}")
                 
                 # Check if file already exists
                 file_exists = os.path.exists(full_file_path)
                 
-                # Write the file
-                with open(full_file_path, "w", encoding='utf-8') as f:
-                    f.write(content)
+                # Write the file with proper encoding
+                try:
+                    with open(full_file_path, "w", encoding='utf-8') as f:
+                        f.write(content)
+                except UnicodeEncodeError:
+                    # Fallback to latin-1 if utf-8 fails
+                    with open(full_file_path, "w", encoding='latin-1', errors='replace') as f:
+                        f.write(content)
+                    results.append(f"  [WARNING] Used latin-1 encoding due to Unicode issues")
                 
                 rel_path = os.path.relpath(full_file_path, WORKSPACE_PATH)
                 
+                # Report file operation
                 if file_exists:
                     results.append(f"[UPDATED] {rel_path} ({len(content)} chars)")
                     updated_count += 1
@@ -334,15 +395,24 @@ def create_project(folder, files):
                 
                 # Validate Python files
                 if full_file_path.endswith('.py'):
-                    error, _ = validate_python_code(content, rel_path)
-                    if error:
-                        results.append(f"  [WARNING] Syntax issues detected")
-                    else:
+                    try:
+                        import ast
+                        ast.parse(content)
                         results.append(f"  [OK] Syntax validation passed")
+                    except SyntaxError as e:
+                        results.append(f"  [WARNING] Syntax issues detected: {str(e)}")
+                        # Optionally create a .syntax_error file for debugging
+                        error_file = full_file_path + '.syntax_error'
+                        with open(error_file, 'w', encoding='utf-8') as f:
+                            f.write(f"Error at line {e.lineno}: {e.msg}\n\n")
+                            f.write(content)
+                    except Exception as e:
+                        results.append(f"  [WARNING] Validation error: {str(e)}")
                 
             except Exception as e:
-                results.append(f"[ERROR] Failed to create file {file_path}: {e}")
+                results.append(f"[ERROR] Failed to create file {file_path}: {str(e)}")
                 error_count += 1
+                debug_info.append(f"Error details: {str(e)}")
         
         # Summary
         results.append("-" * 50)
@@ -353,10 +423,67 @@ def create_project(folder, files):
             results.append(f"  Errors: {error_count} files")
         results.append(f"[OK] Project setup complete!")
         
+        # Add debug info if there were errors
+        if error_count > 0:
+            results.append("\n[DEBUG INFO]")
+            results.extend(debug_info[-5:])  # Last 5 debug messages
+        
         return "\n".join(results)
         
     except Exception as e:
-        return f"[ERROR] Failed to create project: {e}"
+        return f"[ERROR] Failed to create project: {str(e)}"
+def preprocess_ai_response(response_text):
+    """Clean up AI response before JSON parsing"""
+    # Remove markdown code blocks
+    response_text = re.sub(r'```json\s*', '', response_text)
+    response_text = re.sub(r'```\s*', '', response_text)
+    
+    # Remove comments (both // and /* */)
+    response_text = re.sub(r'//.*?\n', '\n', response_text)
+    response_text = re.sub(r'/\*.*?\*/', '', response_text, flags=re.DOTALL)
+    
+    # Fix common JSON issues
+    response_text = response_text.strip()
+    
+    # Ensure it starts with { and ends with }
+    if not response_text.startswith('{'):
+        brace_pos = response_text.find('{')
+        if brace_pos != -1:
+            response_text = response_text[brace_pos:]
+    
+    if not response_text.endswith('}'):
+        brace_pos = response_text.rfind('}')
+        if brace_pos != -1:
+            response_text = response_text[:brace_pos+1]
+    
+    return response_text
+def validate_create_project_action(data):
+    """Validate the create_project action before processing"""
+    if not isinstance(data, dict):
+        return False, "Action must be a dictionary"
+    
+    if data.get('action') != 'create_project':
+        return False, "Not a create_project action"
+    
+    folder = data.get('folder')
+    if not folder or not isinstance(folder, str):
+        return False, "Missing or invalid 'folder' field"
+    
+    files = data.get('files')
+    if not files or not isinstance(files, list):
+        return False, "Missing or invalid 'files' field"
+    
+    for i, file_info in enumerate(files):
+        if not isinstance(file_info, dict):
+            return False, f"File #{i+1} must be a dictionary"
+        
+        if 'path' not in file_info:
+            return False, f"File #{i+1} missing 'path'"
+        
+        if 'content' not in file_info:
+            return False, f"File #{i+1} missing 'content'"
+    
+    return True, "Valid"
 
 
 def find_file_recursive(filename, search_path=None):

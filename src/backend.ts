@@ -9,12 +9,12 @@ export class Backend implements vscode.WebviewViewProvider {
     private context: vscode.ExtensionContext;
     private view?: vscode.WebviewView;
     private outputBuffer: string = '';
-    private readonly RENDER_BACKEND_URL = 'https://ai-code-backend1.onrender.com';
-
+    private readonly RENDER_BACKEND_URL = 'https://worktualvscode.onrender.com';
+    // private readonly RENDER_BACKEND_URL = 'http://127.0.0.1:8000';
     // Pending confirmation data (for file overwrite etc.)
     private pendingConfirmation: any = null;
 
-    // Python backend process
+    // Python backend process (only used locally)
     private pythonProcess?: child_process.ChildProcess;
     private pythonReady: boolean = false;
     private messageQueue: any[] = [];
@@ -27,63 +27,102 @@ export class Backend implements vscode.WebviewViewProvider {
     }
 
     /**
-     * Start the Python backend process for file operations
+     * Start the Python backend process for file operations (local development only)
      */
     private startPythonBackend(): void {
-        const pythonScriptPath = path.join(this.context.extensionPath, 'python', 'backend.py');
+        // Check if we're in development mode
+        const isDevelopment = process.env.NODE_ENV === 'development' || 
+                             !process.env.NODE_ENV || 
+                             this.context.extensionMode === vscode.ExtensionMode.Development;
         
-        // Check if Python backend exists
-        if (!fs.existsSync(pythonScriptPath)) {
-            console.error('Python backend not found at:', pythonScriptPath);
-            return;
-        }
-
-        // Spawn Python process
-        this.pythonProcess = child_process.spawn('python', [pythonScriptPath], {
-            stdio: ['pipe', 'pipe', 'pipe'],
-            cwd: this.context.extensionPath
-        });
-
-        // Handle Python stdout (responses)
-        let buffer = '';
-        this.pythonProcess.stdout?.on('data', (data: Buffer) => {
-            buffer += data.toString();
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || ''; // Keep incomplete line in buffer
+        if (isDevelopment) {
+            const pythonScriptPath = path.join(this.context.extensionPath, 'python', 'backend.py');
             
-            for (const line of lines) {
-                if (line.trim()) {
-                    try {
-                        const response = JSON.parse(line);
-                        this.handlePythonResponse(response);
-                    } catch (e) {
-                        console.log('Python output:', line);
+            // Check if Python backend exists
+            if (!fs.existsSync(pythonScriptPath)) {
+                console.log('Python backend not found - will use Render backend for file operations');
+                this.pythonReady = true; // Mark as ready to use Render fallback
+                return;
+            }
+
+            // Spawn Python process
+            this.pythonProcess = child_process.spawn('python', [pythonScriptPath], {
+                stdio: ['pipe', 'pipe', 'pipe'],
+                cwd: this.context.extensionPath
+            });
+
+            // Handle Python stdout (responses)
+            let buffer = '';
+            this.pythonProcess.stdout?.on('data', (data: Buffer) => {
+                buffer += data.toString();
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || ''; // Keep incomplete line in buffer
+                
+                for (const line of lines) {
+                    if (line.trim()) {
+                        try {
+                            const response = JSON.parse(line);
+                            this.handlePythonResponse(response);
+                        } catch (e) {
+                            console.log('Python output:', line);
+                        }
                     }
                 }
-            }
-        });
-
-        // Handle Python stderr
-        this.pythonProcess.stderr?.on('data', (data: Buffer) => {
-            console.error('Python backend error:', data.toString());
-        });
-
-        // Handle Python process exit
-        this.pythonProcess.on('exit', (code) => {
-            console.log(`Python backend exited with code ${code}`);
-            this.pythonReady = false;
-            this.pythonProcess = undefined;
-        });
-
-        // Send workspace path configuration once ready
-        setTimeout(() => {
-            this.sendToPython({
-                type: 'config',
-                workspacePath: this.getWorkspaceRoot() || path.join(this.context.extensionPath, 'workspace')
             });
-            this.pythonReady = true;
-            this.processMessageQueue();
-        }, 1000);
+
+            // Handle Python stderr
+            this.pythonProcess.stderr?.on('data', (data: Buffer) => {
+                console.error('Python backend error:', data.toString());
+            });
+
+            // Handle Python process exit
+            this.pythonProcess.on('exit', (code) => {
+                console.log(`Python backend exited with code ${code}`);
+                this.pythonReady = false;
+                this.pythonProcess = undefined;
+            });
+
+            // Send workspace path configuration once ready
+            setTimeout(() => {
+                this.sendToPython({
+                    type: 'config',
+                    workspacePath: this.getWorkspaceRoot() || path.join(this.context.extensionPath, 'workspace')
+                });
+                this.pythonReady = true;
+                this.processMessageQueue();
+            }, 1000);
+        } else {
+            console.log('Running in production mode - using Render backend for file operations');
+            this.pythonReady = true; // Mark as ready to use Render fallback
+        }
+    }
+
+    /**
+     * Call Render backend for file operations
+     */
+    private async callRenderFileOperation(action: string, data: any): Promise<string> {
+        try {
+            const workspaceRoot = this.getWorkspaceRoot();
+            if (!workspaceRoot) {
+                return '[ERROR] Please open a folder first';
+            }
+
+            const postData = JSON.stringify({
+                action: action,
+                workspace_path: workspaceRoot,
+                ...data
+            });
+            
+            console.log(`Calling Render file operation: ${action}`, data);
+            
+            const response = await this.httpsPost(`${this.RENDER_BACKEND_URL}/file-operation`, postData);
+            const result = JSON.parse(response);
+            
+            return result.message || result.response || 'Operation completed';
+        } catch (error) {
+            console.error('Render file operation failed:', error);
+            return `[ERROR] File operation failed: ${error}`;
+        }
     }
 
     /**
@@ -184,37 +223,47 @@ export class Backend implements vscode.WebviewViewProvider {
     }
 
     /**
-     * Execute file operation via Python backend
+     * Execute file operation via Python backend (local) or Render backend (production)
      */
     private async executeFileOperation(action: string, data: any): Promise<string> {
-        return new Promise((resolve) => {
-            const messageId = Date.now().toString();
-            
-            // Set up response handler
-            this.responseHandlers.set(messageId, (response: any) => {
-                resolve(response.result || response.text || 'Operation completed');
-            });
+        try {
+            // If Python is ready and we have a process, use it (local development)
+            if (this.pythonReady && this.pythonProcess) {
+                return new Promise((resolve) => {
+                    const messageId = Date.now().toString();
+                    
+                    // Set up response handler
+                    this.responseHandlers.set(messageId, (response: any) => {
+                        resolve(response.result || response.text || 'Operation completed');
+                    });
 
-            // Send to Python
-            this.sendToPython({
-                type: 'file_operation',
-                id: messageId,
-                action: action,
-                ...data
-            });
+                    // Send to Python
+                    this.sendToPython({
+                        type: 'file_operation',
+                        id: messageId,
+                        action: action,
+                        ...data
+                    });
 
-            // Timeout after 30 seconds
-            setTimeout(() => {
-                if (this.responseHandlers.has(messageId)) {
-                    this.responseHandlers.delete(messageId);
-                    resolve('[ERROR] Operation timed out');
-                }
-            }, 30000);
-        });
+                    // Timeout after 30 seconds
+                    setTimeout(() => {
+                        if (this.responseHandlers.has(messageId)) {
+                            this.responseHandlers.delete(messageId);
+                            resolve('[ERROR] Operation timed out');
+                        }
+                    }, 30000);
+                });
+            } else {
+                // Use Render backend for file operations (production)
+                return await this.callRenderFileOperation(action, data);
+            }
+        } catch (error) {
+            return `[ERROR] ${error}`;
+        }
     }
 
 
-        // ------------------------------------------------------------------------
+    // ------------------------------------------------------------------------
     // Workspace helper methods (restored from original)
     // ------------------------------------------------------------------------
 
@@ -326,8 +375,7 @@ export class Backend implements vscode.WebviewViewProvider {
             this.context.subscriptions
         );
 
-        // Start the Python backend
-        // Send ready signal immediately - no backend to start
+        // Send ready signal
         if (this.view) {
             this.view.webview.postMessage({
                 type: 'ready',
@@ -493,10 +541,10 @@ export class Backend implements vscode.WebviewViewProvider {
 
         function formatWebsiteCompleteMessage(data) {
             let html = '<div style="font-weight: bold; margin-bottom: 10px;">🎉 Website Generated Successfully!</div>';
-            html += '<div style="margin-bottom: 10px;">' + data.text.replace(/\\\\n/g, '<br>') + '</div>';
+            html += '<div style="margin-bottom: 10px;">' + data.text.replace(/\\n/g, '<br>') + '</div>';
             
             if (data.preview_url) {
-                html += '<button class="preview-button" onclick="openPreview(\\\\'' + data.preview_url + '\\\\')">🌐 Open Preview</button>';
+                html += '<button class="preview-button" onclick="openPreview(\\'' + data.preview_url + '\\')">🌐 Open Preview</button>';
             }
             
             return html;
